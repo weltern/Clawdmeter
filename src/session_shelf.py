@@ -428,7 +428,7 @@ class UsageBar(QWidget):
 
 
 def apply_overage_bar(title_label, pct_label, bar, title: str, pct: int,
-                      warn_at: int = WARN_PCT_DEFAULT) -> None:
+                      warn_at: int = WARN_PCT_DEFAULT, over_tag: str = "OVERAGE") -> None:
     """Render one usage bar's title, percentage and fill with per-window overage.
 
     Under 100% the bar fills in its heat colour and the title is plain. At/over
@@ -438,18 +438,106 @@ def apply_overage_bar(title_label, pct_label, bar, title: str, pct: int,
     view's rows so both behave identically.
 
     ``warn_at`` is this window's yellow point — see uiutil.bar_warn_thresholds;
-    it differs between the 5h and 7d bars, so callers must pass the right one."""
+    it differs between the 5h and 7d bars, so callers must pass the right one.
+    ``over_tag`` is the red word past 100% (SCOPED_OVER_TAG for scoped rows)."""
     pct = max(0, int(pct))
     over = max(0, pct - 100)
     if over > 0:
         title_label.setText(
             f'{title} <span style="color:{_BAR_OVERAGE}; '
-            f'font-weight:700">OVERAGE</span>')
+            f'font-weight:700">{over_tag}</span>')
         bar.set_values(0, over, "cool")
     else:
         title_label.setText(title)
         bar.set_values(pct, 0, heat(pct, warn_at))
     pct_label.setText(f"{pct}%")
+
+
+# A scoped row past 100% says OVER LIMIT, not OVERAGE: OVERAGE means paid
+# credits on the 5h/7d windows, and whether a model's own cap spills onto them
+# is unverified (the alert wording follows the same rule — see
+# approaching_notify.LimitEvent).
+SCOPED_OVER_TAG = "OVER LIMIT"
+
+
+def scoped_reset_text(window, minutes: int) -> str:
+    """The reset line for a scoped window's row. The usage API has sent a reset
+    time for every scoped window seen so far, but one without must not read as
+    "resets in 0m"."""
+    if window.resets_at is None:
+        return "reset time not reported"
+    return f"resets in {format_minutes(minutes)}"
+
+
+class ScopedRows(QWidget):
+    """The scoped usage windows' rows (e.g. Weekly · Fable) under a view's own
+    5h / 7d bars.
+
+    Each view passes how to build one row and how to draw it, so the rows look
+    like that view's existing ones; this class only adds, removes and orders
+    them by window key, and hides itself — taking no space or layout spacing —
+    when there are none. Shared by the full window, the compact view and the
+    mini widget.
+    """
+
+    def __init__(self, make_row, render_row, *, spacing: int, top_margin: int = 0,
+                 parent=None) -> None:
+        super().__init__(parent)
+        self._make_row = make_row      # () -> (row widget, parts)
+        self._render_row = render_row  # (parts, window, reset_minutes, warn_at)
+        self._rows: dict[str, tuple[QWidget, object]] = {}
+        self._order: list[str] = []
+        self._col = QVBoxLayout(self)
+        self._col.setContentsMargins(0, top_margin, 0, 0)
+        self._col.setSpacing(spacing)
+        self.setVisible(False)
+
+    def keys(self) -> list[str]:
+        return list(self._order)
+
+    def set_windows(self, items) -> bool:
+        """Show exactly ``items`` — ``(window, reset_minutes, warn_at)`` — in
+        order. Returns True when the set or order of rows changed, so a view
+        that sizes to its content knows to re-fit."""
+        keys = [w.key for w, _m, _warn in items]
+        changed = keys != self._order
+        if changed:
+            for key in [k for k in self._rows if k not in keys]:
+                widget, _parts = self._rows.pop(key)
+                self._col.removeWidget(widget)
+                widget.hide()
+                widget.deleteLater()
+            # Re-inserting a row already in this layout moves it, so this both
+            # places new rows and reorders existing ones.
+            for index, key in enumerate(keys):
+                if key not in self._rows:
+                    self._rows[key] = self._make_row()
+                self._col.insertWidget(index, self._rows[key][0])
+            self._order = keys
+            self.setVisible(bool(keys))
+        for window, minutes, warn_at in items:
+            self._render_row(self._rows[window.key][1], window, minutes, warn_at)
+        return changed
+
+    def settle(self) -> None:
+        """Recompute the rows' layouts, then this widget's and every ancestor's,
+        now — leaves first, since each activation is what passes a changed size
+        up to its parent. For a small window that sizes itself to its content
+        (compact, mini), called just before it re-fits: each layout otherwise
+        recomputes on its own queued event, so the re-fit reads stale hints.
+        Both were measured: removing two rows left the compact view at 261px
+        where its content needed 177, and a longer reset text ("resets in 2d
+        22h") was clipped because the mini locked its width to the old one.
+        Not for the full window, whose shelf sizes itself from resize events —
+        forcing its layouts every tick broke the mascot sizing."""
+        for widget, _parts in self._rows.values():
+            if widget.layout() is not None:
+                widget.layout().activate()
+        widget = self
+        while widget is not None:
+            if widget.layout() is not None:
+                widget.layout().activate()
+            widget = widget.parentWidget()
 
 
 class AgentMascot(QWidget):
@@ -1186,6 +1274,13 @@ class SessionShelf(QWidget):
         super().resizeEvent(e)
         self._layout_tiles()
 
+    def relayout_tiles(self) -> None:
+        """Re-size the mascots to the viewport as it is now. For a caller that
+        took height from the shelf without resizing the window: the shelf's
+        resize event can arrive before its viewport has shrunk, leaving the
+        mascot sized for the old height and clipped."""
+        self._layout_tiles()
+
     def _layout_tiles(self) -> None:
         """Size every mascot identically, from ONE calculation for the shelf.
 
@@ -1569,6 +1664,11 @@ class CompactView(QWidget):
         self.s_label, self.s_pct, self.s_bar, self.s_reset = self._slim_bar(bcol)
         bcol.addSpacing(4)
         self.w_label, self.w_pct, self.w_bar, self.w_reset = self._slim_bar(bcol)
+        # Scoped windows the user ticked (e.g. WEEKLY · FABLE), same slim rows
+        # and the same 4px gap as between SESSION and WEEKLY.
+        self.scoped_rows = ScopedRows(self._make_scoped_row, self._render_scoped_row,
+                                      spacing=3 + 4, top_margin=4)
+        bcol.addWidget(self.scoped_rows)
         outer.addWidget(bars)
 
         # scrollable session list
@@ -1645,6 +1745,21 @@ class CompactView(QWidget):
         parent_col.addWidget(reset)
         return label, pct, bar, reset
 
+    def _make_scoped_row(self):
+        row = QWidget()
+        col = QVBoxLayout(row)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(3)
+        return row, self._slim_bar(col)
+
+    @staticmethod
+    def _render_scoped_row(parts, window, minutes: int, warn_at: int) -> None:
+        label, pct, bar, reset = parts
+        # No token figure: the local transcripts can't be split per limit.
+        apply_overage_bar(label, pct, bar, window.label.upper(), window.pct, warn_at,
+                          over_tag=SCOPED_OVER_TAG)
+        reset.setText(scoped_reset_text(window, minutes))
+
     @staticmethod
     def _apply_bar(label, pct, bar, reset, title, value,
                    reset_min, tokens, show_tokens, warn_at) -> None:
@@ -1655,7 +1770,10 @@ class CompactView(QWidget):
             line += f" · {fmt_tokens(tokens)}"
         reset.setText(line)
 
-    def update_usage(self, s, sr: int, wr: int, show_tokens: bool) -> None:
+    def update_usage(self, s, sr: int, wr: int, show_tokens: bool,
+                     scoped=()) -> None:
+        """``scoped``: ``(window, reset_minutes, warn_at)`` for each scoped
+        window being shown, in order."""
         # The 5h and 7d bars turn yellow at different points — each follows its
         # own approaching-limit notification threshold.
         s_warn, w_warn = bar_warn_thresholds()
@@ -1665,6 +1783,11 @@ class CompactView(QWidget):
         self._apply_bar(self.w_label, self.w_pct, self.w_bar, self.w_reset,
                         "WEEKLY 7d", s.weekly_pct, wr, s.tokens_7d, show_tokens,
                         w_warn)
+        if self.scoped_rows.set_windows(scoped):
+            # Grow/shrink by the rows added or removed. Width is fixed, so a
+            # steady row set (only its text changing) never needs a re-fit.
+            self.scoped_rows.settle()
+            self.adjustSize()
 
     def set_show_tokens(self, on: bool) -> None:
         self._show_tokens = bool(on)
