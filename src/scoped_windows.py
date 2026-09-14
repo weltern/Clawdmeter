@@ -19,15 +19,16 @@ class ScopedWindow:
     """One scoped limit at the moment it was polled."""
 
     key: str    # stable identity for Settings, e.g. "weekly:Fable"
-    group: str  # the API's window group: "weekly" / "session"
+    group: str  # the API's window group: "weekly" / "session" ("" if absent)
     name: str   # what the limit is scoped to, e.g. "Fable"
     pct: int    # utilisation %; like the 5h/7d windows it is not clamped at 100
     resets_at: float | None = None  # epoch seconds, None when the API gives none
 
     @property
     def label(self) -> str:
-        """"Weekly · Fable" — the group reads the same way as the main bars."""
-        return f"{self.group.capitalize()} · {self.name}"
+        """"Weekly · Fable" — the group reads the same way as the main bars.
+        Just the name when the API gave no group, rather than guess one."""
+        return f"{self.group.capitalize()} · {self.name}" if self.group else self.name
 
     def reset_minutes(self, now: float) -> int:
         """Whole minutes from ``now`` until the reset, rounded the same way as
@@ -81,8 +82,8 @@ def windows_from_limits(limits) -> list[ScopedWindow]:
         if not name or isinstance(pct, bool) or not isinstance(pct, (int, float)):
             continue
         group = entry.get("group") if isinstance(entry.get("group"), str) else ""
-        group = group.strip().lower() or "weekly"
-        key = f"{group}:{name}"
+        group = group.strip().lower()
+        key = f"{group or 'limit'}:{name}"
         if key in seen:
             continue
         seen.add(key)
@@ -137,6 +138,7 @@ def merge_seen(seen, windows) -> list[tuple[str, str]]:
 
 def warn_threshold_for(window: ScopedWindow, session: int, weekly: int) -> int:
     """Which of the user's two thresholds a scoped window follows — by its
-    group, so a weekly cap on one model uses the 7d setting. Shared by the bar
-    colour and the approaching alert so they agree."""
+    group, so a weekly cap on one model uses the 7d setting (as does one with
+    no group: the earlier-warning of the two). Shared by the bar colour and
+    the approaching alert so they agree."""
     return session if window.group == "session" else weekly

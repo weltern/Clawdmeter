@@ -79,6 +79,12 @@ def test_skips_unusable_entries_and_keeps_first_of_a_repeated_key():
     assert windows_from_limits(None) == []
 
 
+def test_missing_group_is_not_labelled_weekly():
+    (w,) = windows_from_limits([{"percent": 9, "scope": {"model": {"display_name": "Opus"}}}])
+    assert (w.key, w.label) == ("limit:Opus", "Opus")
+    assert warn_threshold_for(w, session=90, weekly=80) == 80
+
+
 def test_unparseable_reset_is_unknown_not_zero_minutes_ago():
     (w,) = windows_from_limits([{"group": "weekly", "percent": 3, "resets_at": "soon",
                                  "scope": {"model": {"display_name": "Opus"}}}])
@@ -182,14 +188,23 @@ def test_poll_parses_scoped_windows(monkeypatch):
     assert s.ok and [w.key for w in s.scoped_windows] == ["weekly:Fable"]
 
 
-@pytest.mark.parametrize("usage_status,profile_status", [(500, 200), (401, 200), (200, 503)])
-def test_failed_enrichment_is_unknown_not_empty(monkeypatch, usage_status, profile_status):
+@pytest.mark.parametrize("usage_status", [500, 401])
+def test_failed_usage_request_is_unknown_not_empty(monkeypatch, usage_status):
     # An error body is still JSON; parsed, it would read as "no scoped windows"
     # and blank the bars. It must come back as None so the last-known stay.
-    _patch_transport(monkeypatch, usage_status, profile_status)
+    _patch_transport(monkeypatch, usage_status)
     s = poller._poll_once("t")
     assert s.ok is True and s.weekly_pct == 82
     assert s.scoped_windows is None
+
+
+def test_failed_profile_request_keeps_the_usage_fields(monkeypatch):
+    # Only the plan tier comes from the profile; its failing must not throw
+    # away the scoped windows (or the spend) that usage did return.
+    _patch_transport(monkeypatch, 200, profile_status=503)
+    s = poller._poll_once("t")
+    assert [w.key for w in s.scoped_windows] == ["weekly:Fable"]
+    assert s.plan_tier is None
 
 
 # --- approaching alerts ----------------------------------------------------

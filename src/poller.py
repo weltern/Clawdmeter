@@ -240,11 +240,12 @@ def _poll_once(token: str) -> UsageSample:
             # K1: enrich with the OAuth usage + profile endpoints (plan tier,
             # extra-usage spend, per-model windows) on the same client/cadence.
             # Non-fatal: any failure leaves the header-derived sample intact.
-            # raise_for_status: an error body parses as JSON too, and would read
-            # as "no scoped windows" rather than "didn't find out".
+            # raise_for_status on usage only: its error body parses as JSON too,
+            # and would read as "no scoped windows" rather than "didn't find
+            # out". A profile error body just leaves the plan tier unknown.
             try:
                 usage = http.get(USAGE_URL, headers=headers).raise_for_status().json()
-                profile = http.get(PROFILE_URL, headers=headers).raise_for_status().json()
+                profile = http.get(PROFILE_URL, headers=headers).json()
                 for k, v in usage_fields_from_json(usage, profile).items():
                     setattr(sample, k, v)
             except (httpx.HTTPError, ValueError, TypeError):

@@ -2679,11 +2679,11 @@ class SettingsPanel(QWidget):
                 text += self._SCOPED_ABSENT_SUFFIX
             check = QCheckBox(text)
             check.setChecked(key in shown)
-            check.toggled.connect(lambda _on, k=key: self._on_scoped_toggled(k))
+            check.toggled.connect(self._on_scoped_toggled)
             self._scoped_col.addWidget(check)
             self._scoped_checks[key] = check
 
-    def _on_scoped_toggled(self, _key: str) -> None:
+    def _on_scoped_toggled(self, _checked: bool) -> None:
         # Save every box's state (not a toggle of one key) so the stored list
         # always matches what's on screen, in Settings order.
         app_settings.set_scoped_shown(
