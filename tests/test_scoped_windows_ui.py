@@ -176,6 +176,27 @@ def test_shelf_mascots_fit_when_launched_with_a_row_ticked(dash):
             == dash.weekly_title.mapTo(page, dash.weekly_title.rect().topLeft()).x())
 
 
+def test_idle_mascot_shrinks_for_a_row_instead_of_growing_the_window(dash):
+    # No sessions: the 240px idle mascot used to be a fixed size, so a row it
+    # had no room for forced the window taller (measured 572 -> 627px).
+    dash._on_sessions([])
+    dash.resize(812, 760)
+    dash.show()
+    _settle()
+    assert dash.hero.isVisible()
+    # Plenty of room: exactly the size it has always been, not bigger.
+    assert dash.sprite._render_size() == dashboard.HERO_MASCOT_MAX
+
+    dash.resize(812, 572)
+    dash._on_sample(_sample(_fable(93)))
+    app_settings.set_scoped_shown(["weekly:Fable"])
+    dash._apply_scoped_view()
+    _settle()
+    assert dash.height() == 572
+    assert dash.sprite._render_size() < dashboard.HERO_MASCOT_MAX
+    assert dash.sprite.width() <= dashboard.HERO_MASCOT_MAX   # never past its old size
+
+
 def test_mini_width_follows_a_longer_reset_text(dash):
     app_settings.set_scoped_shown(["weekly:Fable"])
     dash._apply_scoped_view()

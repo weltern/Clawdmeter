@@ -160,6 +160,9 @@ def _should_persist_size(fit_armed: bool, fitting: bool) -> bool:
 # Valid view modes, largest -> smallest.
 VIEW_ORDER = ("full", "compact", "mini")
 
+# The empty-state (no sessions) mascot's size when the window has room for it.
+HERO_MASCOT_MAX = 240
+
 
 # The frameless windows draw a 1px #root border to define their edge -- good on
 # Windows/Linux, but on macOS it reads as a stray dark line around the window
@@ -3178,7 +3181,14 @@ class Dashboard(QMainWindow):
         # Hero mascot for the EMPTY (0-session) state — the single rate-driven
         # mascot that's been the app's face from day one. Wrapped in its own
         # widget so the whole block can hide as a unit when the shelf is shown.
-        self.sprite = SpritePlayer(size=240)
+        # Scales to the height it is given, capped at its long-standing 240px,
+        # so a window with room looks as it always has. When there isn't room —
+        # additional-limit rows taking height — the mascot shrinks instead of
+        # its minimum size forcing the window taller (measured: 572 -> 627px
+        # for one row), the same way the session shelf's mascots already fit.
+        self.sprite = SpritePlayer(size=HERO_MASCOT_MAX, scale_to_fit=True,
+                                   min_size=SessionShelf.MIN_MASCOT)
+        self.sprite.setMaximumSize(HERO_MASCOT_MAX, HERO_MASCOT_MAX)
         self.hero = QWidget()
         sprite_row = QHBoxLayout(self.hero)
         sprite_row.setContentsMargins(0, 0, 0, 0)
