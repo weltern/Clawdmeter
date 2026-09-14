@@ -95,8 +95,10 @@ from update_check import UpdateChecker
 from pricing_refresh import PricingRefresher
 import session_shelf
 from session_shelf import (
-    CompactView, SessionShelf, UsageBar, apply_overage_bar,
+    SCOPED_OVER_TAG, CompactView, ScopedRows, SessionShelf, UsageBar,
+    apply_overage_bar, scoped_reset_text,
 )
+import scoped_windows
 from sprite_player import SpritePlayer, assets_root
 from transcript import (
     ACTIVITY_ANIMS,
@@ -440,6 +442,11 @@ class MiniWidget(QWidget):
         stack.setSpacing(3)
         self.session_pct, self.session_reset, self.session_bar = self._row(stack, "miniPct")
         self.weekly_pct, self.weekly_reset, self.weekly_bar = self._row(stack, "miniPctSub")
+        # Scoped windows the user ticked, each a dim row like WEEKLY's with the
+        # limit's name leading its reset text (the mini has no titles).
+        self.scoped_rows = ScopedRows(self._make_scoped_row, self._render_scoped_row,
+                                      spacing=3)
+        stack.addWidget(self.scoped_rows)
         row.addLayout(stack, 1)
 
         # ThemedPopup, not QMenu — a menu's panel cannot be painted opaque on
@@ -452,7 +459,28 @@ class MiniWidget(QWidget):
         self.customContextMenuRequested.connect(
             lambda pos: self._menu.popup_at(self.mapToGlobal(pos))
         )
-        self.setToolTip("Session (top) · Weekly (bottom)\nDouble-click to expand · drag to move")
+        self._set_rows_tooltip([])
+
+    _TOOLTIP_HINT = "Double-click to expand · drag to move"
+
+    def _set_rows_tooltip(self, labels: list[str]) -> None:
+        if not labels:
+            rows = "Session (top) · Weekly (bottom)"
+        else:
+            rows = "Top to bottom: Session · Weekly · " + " · ".join(labels)
+        self.setToolTip(f"{rows}\n{self._TOOLTIP_HINT}")
+
+    def _make_scoped_row(self):
+        row = QWidget()
+        col = QVBoxLayout(row)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(3)
+        return row, self._row(col, "miniPctSub")
+
+    def _render_scoped_row(self, parts, window, minutes: int, warn_at: int) -> None:
+        pct, reset, bar = parts
+        self._set_bar(pct, bar, window.pct, warn_at)
+        reset.setText(f"{window.name} · {scoped_reset_text(window, minutes)}")
 
     def _row(self, parent_layout: QVBoxLayout, pct_object: str):
         line = QHBoxLayout()
@@ -477,11 +505,12 @@ class MiniWidget(QWidget):
         return pct, reset, bar
 
     def update_usage(self, session_pct: int, weekly_pct: int,
-                     session_reset_minutes: int, weekly_reset_minutes: int) -> None:
+                     session_reset_minutes: int, weekly_reset_minutes: int,
+                     scoped=()) -> None:
         s_warn, w_warn = bar_warn_thresholds()
         self._set_bar(self.session_pct, self.session_bar, session_pct, s_warn)
         self._set_bar(self.weekly_pct, self.weekly_bar, weekly_pct, w_warn)
-        self.set_resets(session_reset_minutes, weekly_reset_minutes)
+        self.set_resets(session_reset_minutes, weekly_reset_minutes, scoped)
 
     @staticmethod
     def _set_bar(pct_label, bar, pct: int, warn_at: int) -> None:
@@ -495,10 +524,18 @@ class MiniWidget(QWidget):
             bar.set_values(pct, 0, _heat(pct, warn_at))
         pct_label.setText(f"{pct}%")
 
-    def set_resets(self, session_reset_minutes: int, weekly_reset_minutes: int) -> None:
-        """Reset labels in the same relative form as the main window."""
+    def set_resets(self, session_reset_minutes: int, weekly_reset_minutes: int,
+                   scoped=()) -> None:
+        """Reset labels in the same relative form as the main window.
+        ``scoped``: ``(window, reset_minutes, warn_at)`` per scoped window shown —
+        pass it on every call, since an empty value removes those rows."""
         self.session_reset.setText(f"resets in {_format_minutes(session_reset_minutes)}")
         self.weekly_reset.setText(f"resets in {_format_minutes(weekly_reset_minutes)}")
+        if self.scoped_rows.set_windows(scoped):
+            self._set_rows_tooltip([w.label for w, _m, _warn in scoped])
+        # The width follows the reset texts, which change every minute, so the
+        # rows' own layouts must be current before lock_size measures.
+        self.scoped_rows.settle()
         self.lock_size()
 
     # Qt's QWIDGETSIZE_MAX — the "no constraint" sentinel for max size.
@@ -1687,7 +1724,7 @@ class SettingsPanel(QWidget):
                  on_refresh_token=None, on_auto_refresh_changed=None,
                  on_poll_interval_changed=None, on_sessions_view_changed=None,
                  on_token_view_changed=None, on_check_updates=None,
-                 on_idle_backoff_changed=None) -> None:
+                 on_idle_backoff_changed=None, on_scoped_view_changed=None) -> None:
         super().__init__(parent)
         self.setObjectName("settingsPanel")
         self.setAttribute(Qt.WA_StyledBackground, True)
@@ -1700,6 +1737,7 @@ class SettingsPanel(QWidget):
         self._on_token_view_changed = on_token_view_changed
         self._on_check_updates = on_check_updates
         self._on_idle_backoff_changed = on_idle_backoff_changed
+        self._on_scoped_view_changed = on_scoped_view_changed
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1965,6 +2003,28 @@ class SettingsPanel(QWidget):
         self.token_usage_check.setChecked(app_settings.get_show_token_usage())
         self.token_usage_check.toggled.connect(self._on_token_usage_toggled)
         layout.addWidget(self.token_usage_check)
+
+        layout.addSpacing(10)
+        layout.addWidget(QLabel("ADDITIONAL LIMITS", objectName="sectionLabel"))
+        scoped_hint = QLabel(
+            "Some plans also have limits beyond the 5-hour and weekly windows, "
+            "like a weekly limit on one model. Tick one to add its bar to the "
+            "dashboard, compact and mini views. Approaching-limit alerts, when "
+            "on, cover it too.",
+            objectName="sectionHint",
+        )
+        scoped_hint.setWordWrap(True)
+        layout.addWidget(scoped_hint)
+        # One checkbox per window ever reported, rebuilt when that list changes
+        # (see set_scoped_windows).
+        self._scoped_box = QWidget()
+        self._scoped_col = QVBoxLayout(self._scoped_box)
+        self._scoped_col.setContentsMargins(0, 0, 0, 0)
+        self._scoped_col.setSpacing(6)
+        layout.addWidget(self._scoped_box)
+        self._scoped_checks: dict[str, QCheckBox] = {}
+        self._scoped_state = None
+        self.set_scoped_windows(app_settings.get_scoped_seen(), None)
 
         layout = conn_layout
         layout.addSpacing(10)
@@ -2584,6 +2644,50 @@ class SettingsPanel(QWidget):
         if self._on_token_view_changed:
             self._on_token_view_changed()
 
+    _SCOPED_EMPTY_TEXT = "None reported for your account yet."
+    _SCOPED_ABSENT_SUFFIX = " — not reported right now"
+
+    def set_scoped_windows(self, seen, current_keys) -> None:
+        """Rebuild the ADDITIONAL LIMITS checkboxes: one per remembered
+        ``(key, label)``, ticked from the saved choice. ``current_keys`` — the
+        keys in the latest usage response, or None before any — marks a
+        remembered window that isn't being reported, so ticking it and seeing
+        no bar isn't a mystery. Called on every poll; a no-op unless something
+        it shows changed."""
+        seen = list(seen)
+        current = None if current_keys is None else frozenset(current_keys)
+        if (seen, current) == self._scoped_state:
+            return
+        self._scoped_state = (seen, current)
+        while self._scoped_col.count():
+            item = self._scoped_col.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self._scoped_checks = {}
+        if not seen:
+            empty = QLabel(self._SCOPED_EMPTY_TEXT, objectName="sectionHint")
+            empty.setWordWrap(True)
+            self._scoped_col.addWidget(empty)
+            return
+        shown = set(app_settings.get_scoped_shown())
+        for key, label in seen:
+            text = label
+            if current is not None and key not in current:
+                text += self._SCOPED_ABSENT_SUFFIX
+            check = QCheckBox(text)
+            check.setChecked(key in shown)
+            check.toggled.connect(lambda _on, k=key: self._on_scoped_toggled(k))
+            self._scoped_col.addWidget(check)
+            self._scoped_checks[key] = check
+
+    def _on_scoped_toggled(self, _key: str) -> None:
+        # Save every box's state (not a toggle of one key) so the stored list
+        # always matches what's on screen, in Settings order.
+        app_settings.set_scoped_shown(
+            [k for k, c in self._scoped_checks.items() if c.isChecked()])
+        if self._on_scoped_view_changed:
+            self._on_scoped_view_changed()
+
     def _make_threshold_slider(self, label: str, value: int, on_change):
         """A row for an approaching-limit % threshold: window label, a slider over
         the allowed range, and an editable value field. Drag the slider or type a
@@ -3106,6 +3210,19 @@ class Dashboard(QMainWindow):
         self.weekly_row, self.weekly_title, self.weekly_pct, self.weekly_bar, self.weekly_reset = self._build_row("WEEKLY (7d)")
         layout.addLayout(self.weekly_row)
 
+        # Scoped windows ticked in Settings (e.g. WEEKLY · FABLE): full-size
+        # rows at the main layout's 12px rhythm. Hidden, it takes no space. The
+        # window is not resized for them (see _apply_session_view) — they take
+        # their height from the mascot area above.
+        self.scoped_rows = ScopedRows(self._make_scoped_row, self._render_scoped_row,
+                                      spacing=12)
+        layout.addWidget(self.scoped_rows)
+        # Scoped-window state: last-known list (kept across a failed usage
+        # request) and the keys ticked in Settings, cached off the registry
+        # because the 1s countdown reads it.
+        self._scoped = scoped_windows.ScopedWindowTracker()
+        self._scoped_shown = app_settings.get_scoped_shown()
+
         # Status badge: only visible when nearing/at the rate limit. When
         # hidden it takes zero vertical space so the WEEKLY bar hugs the
         # bottom; when shown the layout grows to fit it.
@@ -3151,6 +3268,7 @@ class Dashboard(QMainWindow):
             on_token_view_changed=self._apply_token_view,
             on_check_updates=self._check_for_updates_now,
             on_idle_backoff_changed=self._apply_poll_cadence,
+            on_scoped_view_changed=self._apply_scoped_view,
         )
         self._pages.addWidget(self.settings_panel)   # index 2 (Settings)
 
@@ -3682,10 +3800,10 @@ class Dashboard(QMainWindow):
             self.stat_spend.setText("$0.00")
             self.stat_spend_sub.setText("Pay-as-you-go off")
         self._render_roi()
-        # Per-model usage windows the API reports (e.g. Weekly · Fable 5). The
-        # overall 5h/7d windows aren't repeated — they're on the Dashboard.
-        # Insertion order (don't sort) keeps rows from reshuffling per poll.
-        windows = [(f"Weekly · {m}", p) for m, p in s.model_windows.items()]
+        # Scoped usage windows the API reports (e.g. Weekly · Fable) — every
+        # one, ticked on the Dashboard or not. The overall 5h/7d windows aren't
+        # repeated here. API order (don't sort) keeps rows from reshuffling.
+        windows = [(w.label, w.pct) for w in self._scoped.windows]
         self.stat_windows.set_data(windows, sort=False)
         self._update_burn(s)
 
@@ -3895,6 +4013,36 @@ class Dashboard(QMainWindow):
         outer.addWidget(reset)
         return outer, label, pct, bar, reset
 
+    def _make_scoped_row(self):
+        outer, label, pct, bar, reset = self._build_row("")
+        # A widget's layout gets default margins; the SESSION/WEEKLY rows are
+        # bare layouts with none, so without this the row sits inset from them.
+        outer.setContentsMargins(0, 0, 0, 0)
+        row = QWidget()
+        row.setLayout(outer)
+        return row, (label, pct, bar, reset)
+
+    @staticmethod
+    def _render_scoped_row(parts, window, minutes: int, warn_at: int) -> None:
+        label, pct, bar, reset = parts
+        # No token figure: the local transcripts can't be split per limit.
+        apply_overage_bar(label, pct, bar, window.label.upper(), window.pct, warn_at,
+                          over_tag=SCOPED_OVER_TAG)
+        reset.setText(scoped_reset_text(window, minutes))
+
+    def _scoped_items(self, s: UsageSample) -> list:
+        """``(window, reset_minutes, warn_at)`` for each scoped window ticked in
+        Settings, for every view's rows. Reset minutes count down from the
+        sample the same way as the 5h/7d windows (_tick_countdown), so a scoped
+        window resetting with the weekly one shows the same time."""
+        s_warn, w_warn = bar_warn_thresholds()
+        elapsed_min = int((time.time() - s.timestamp) // 60)
+        return [
+            (w, max(0, w.reset_minutes(s.timestamp) - elapsed_min),
+             scoped_windows.warn_threshold_for(w, s_warn, w_warn))
+            for w in scoped_windows.shown(self._scoped.windows, self._scoped_shown)
+        ]
+
     def _start_poller(self) -> None:
         self._poller = UsagePoller(interval_seconds=app_settings.get_poll_interval())
         self._poller.sample.connect(self._on_sample)
@@ -4051,6 +4199,9 @@ class Dashboard(QMainWindow):
     def _start_mock(self) -> None:
         self._mock_pct = 12
         self._mock_sample_timer = QTimer(self)
+        from datetime import datetime, timezone
+        mock_weekly_reset = datetime.fromtimestamp(
+            time.time() + (4 * 24 * 60 + 6 * 60) * 60, timezone.utc).isoformat()
 
         def sample_tick():
             # Cycle 0..129 so both windows cross 100% — the per-window red
@@ -4071,7 +4222,15 @@ class Dashboard(QMainWindow):
                 plan_tier="default_claude_max_5x",
                 extra_usage_enabled=True,
                 extra_usage_used_usd=round(self._mock_pct * 0.3, 2),
-                model_windows={"Opus": 62, "Sonnet": 18, "Fable 5": 41},
+                # Shaped like the live API (limits[] names the model "Fable").
+                # Fable cycles so its row's yellow/red states show too. Only a
+                # window the live API really reports: mock mode uses the real
+                # settings, and Settings remembers every window it has seen.
+                scoped_windows=scoped_windows.windows_from_limits([
+                    {"group": "weekly", "percent": (self._mock_pct + 30) % 130,
+                     "resets_at": mock_weekly_reset,
+                     "scope": {"model": {"display_name": "Fable"}}},
+                ]),
             ))
         self._mock_sample_timer.timeout.connect(sample_tick)
         self._mock_sample_timer.start(800)
@@ -4231,6 +4390,8 @@ class Dashboard(QMainWindow):
         # re-renders it anyway, so this only has to serve someone already
         # sitting on the page.
         self._refresh_token_status_if_watched()
+        if s.ok:
+            self._observe_scoped(s)
         # Feed every sample (incl. errors) so the notifiers can ignore them
         # without disturbing their baselines.
         decision = self._reset_notifier.observe(s)
@@ -4240,6 +4401,7 @@ class Dashboard(QMainWindow):
             session_threshold=app_settings.get_approaching_session_pct(),
             weekly_threshold=app_settings.get_approaching_weekly_pct(),
             overage_enabled=app_settings.get_overage_alert_enabled(),
+            scoped=scoped_windows.shown(self._scoped.windows, self._scoped_shown),
         )
         self._last_sample = s
         self.usage_history.record(s)   # ring + throttled disk log (skips errors)
@@ -4253,6 +4415,7 @@ class Dashboard(QMainWindow):
         # Each window handles its own overage: once 5h / 7d crosses 100% the bar
         # restarts red and a red OVERAGE tag joins its title.
         self._render_usage_bars(s)
+        self._set_full_scoped_rows(self._scoped_items(s))
 
         self._refresh_reset_lines(
             s, s.session_reset_minutes, s.weekly_reset_minutes)
@@ -4288,17 +4451,59 @@ class Dashboard(QMainWindow):
         body = f"{which} limit has reset — you can resume."
         self._deliver_alert("Claude limit reset", body)
 
+    def _observe_scoped(self, s: UsageSample) -> None:
+        """Take an OK sample's scoped windows: hold the last-known list (a
+        failed usage request, None, keeps it), and remember any newly reported
+        window so Settings can offer its checkbox."""
+        self._scoped.observe(s.scoped_windows)
+        if s.scoped_windows is None:
+            return
+        seen = app_settings.get_scoped_seen()
+        merged = scoped_windows.merge_seen(seen, s.scoped_windows)
+        if merged != seen:
+            app_settings.set_scoped_seen(merged)
+        self.settings_panel.set_scoped_windows(
+            merged, [w.key for w in s.scoped_windows])
+
+    def _apply_scoped_view(self) -> None:
+        """A scoped-window checkbox changed in Settings: re-render every view's
+        rows from the last sample now rather than on the next poll."""
+        self._scoped_shown = app_settings.get_scoped_shown()
+        s = self._last_sample
+        if s is None or not s.ok:
+            return
+        self._tick_countdown()  # every view's rows + reset lines, current times
+
+    def _set_full_scoped_rows(self, items) -> None:
+        """The full window's scoped rows. They take their height from the
+        mascot area (the window is not resized), and the shelf's resize event
+        can arrive before its viewport has shrunk — measured: a 248px mascot
+        left in a 185px viewport, clipped. So once the layout pass the change
+        queues has run, re-size the mascots to the viewport they really have."""
+        if self.scoped_rows.set_windows(items):
+            QTimer.singleShot(0, self.shelf.relayout_tiles)
+
     def _fire_approaching_notification(self, events: list) -> None:
         """Surface approaching-limit / overage events via the shared channels."""
         overage = any(e.kind == "overage" for e in events)
-        title = "Claude overage started" if overage else "Approaching Claude limit"
-        lines = [
-            f"{e.window} passed 100% — now using paid credits."
-            if e.kind == "overage"
-            else f"{e.window} is at {e.pct}% of your limit."
-            for e in events
-        ]
-        self._deliver_alert(title, "\n".join(lines))
+        reached = any(e.kind == "reached" for e in events)
+        if overage:
+            title = "Claude overage started"
+        elif reached:
+            title = "Claude limit reached"
+        else:
+            title = "Approaching Claude limit"
+
+        def line(e) -> str:
+            if e.kind == "overage":
+                return f"{e.window} passed 100% — now using paid credits."
+            if e.kind == "reached":
+                # A scoped window: what happens past 100% is unverified, so say
+                # only what is known. See approaching_notify.LimitEvent.
+                return f"{e.window} reached 100% of its limit."
+            return f"{e.window} is at {e.pct}% of your limit."
+
+        self._deliver_alert(title, "\n".join(line(e) for e in events))
 
     def _deliver_alert(self, title: str, body: str) -> None:
         """Send an alert over the user's chosen channels (shared by reset and
@@ -4691,7 +4896,9 @@ class Dashboard(QMainWindow):
         sr = max(0, s.session_reset_minutes - elapsed_min)
         wr = max(0, s.weekly_reset_minutes - elapsed_min)
         self._refresh_reset_lines(s, sr, wr)
-        self.mini.set_resets(sr, wr)
+        scoped = self._scoped_items(s)
+        self._set_full_scoped_rows(scoped)
+        self.mini.set_resets(sr, wr, scoped)
         self._update_compact_usage(s, sr, wr)
         self._set_tray_tooltip(s.session_pct, sr, s.weekly_pct, wr)
 
@@ -4828,6 +5035,7 @@ class Dashboard(QMainWindow):
         self.mini.update_usage(
             s.session_pct, s.weekly_pct,
             s.session_reset_minutes, s.weekly_reset_minutes,
+            self._scoped_items(s),
         )
 
     # The title-bar button cycles forward (full -> compact -> mini -> full);
@@ -4893,6 +5101,7 @@ class Dashboard(QMainWindow):
         if s is None or not getattr(s, "ok", False):
             return
         self._render_usage_bars(s)
+        self._set_full_scoped_rows(self._scoped_items(s))
         self._sync_mini(s)
         self._update_compact_usage(
             s, s.session_reset_minutes, s.weekly_reset_minutes)
@@ -5016,12 +5225,14 @@ class Dashboard(QMainWindow):
             cv.update_usage(s,
                             max(0, s.session_reset_minutes - e),
                             max(0, s.weekly_reset_minutes - e),
-                            app_settings.get_show_token_usage())
+                            app_settings.get_show_token_usage(),
+                            self._scoped_items(s))
 
     def _update_compact_usage(self, s, sr: int, wr: int) -> None:
         cv = getattr(self, "compact_view", None)
         if cv is not None and cv.isVisible():
-            cv.update_usage(s, sr, wr, app_settings.get_show_token_usage())
+            cv.update_usage(s, sr, wr, app_settings.get_show_token_usage(),
+                            self._scoped_items(s))
 
     def _show_window(self) -> None:
         """Bring the app to the front for a tray click / second launch. Restores

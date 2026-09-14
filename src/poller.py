@@ -17,7 +17,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -26,6 +26,7 @@ from PySide6.QtCore import QThread, Signal
 import app_settings
 import macos_keychain
 import token_refresh
+from scoped_windows import ScopedWindow, windows_from_limits
 from transcript import account_window_tokens
 
 API_URL = "https://api.anthropic.com/v1/messages"
@@ -75,7 +76,10 @@ class UsageSample:
     extra_usage_enabled: bool = False
     extra_usage_used_usd: float = 0.0       # real extra-usage spend, in dollars
     extra_usage_limit_usd: float | None = None  # monthly cap in $, None = uncapped
-    model_windows: dict = field(default_factory=dict)  # {model display name: percent}
+    # Scoped limits beside the 5h/7d windows (e.g. Weekly · Fable). None means
+    # the usage request didn't succeed this poll — NOT "no scoped limits",
+    # which is an empty list — so the dashboard can keep the last-known ones.
+    scoped_windows: list[ScopedWindow] | None = None
 
 
 def credentials_path() -> Path:
@@ -190,8 +194,8 @@ def usage_fields_from_json(usage: dict | None, profile: dict | None) -> dict:
     Pure (no network) and defensive: every field falls back to a sane default on
     missing/null input, so a partial or changed response can't crash a poll.
     Money comes from `spend.used` (amount_minor / 10**exponent) — never read the
-    minor-unit integer as dollars. Per-model windows come from the `limits[]`
-    array's model-scoped entries.
+    minor-unit integer as dollars. Scoped windows come from the `limits[]`
+    array's scoped entries (see scoped_windows.windows_from_limits).
     """
     usage = usage or {}
     profile = profile or {}
@@ -212,19 +216,12 @@ def usage_fields_from_json(usage: dict | None, profile: dict | None) -> dict:
     else:
         limit_usd = None
 
-    windows: dict[str, int] = {}
-    for entry in usage.get("limits") or []:
-        model = ((entry.get("scope") or {}).get("model") or {}).get("display_name")
-        pct = entry.get("percent")
-        if model and isinstance(pct, (int, float)):
-            windows[model] = int(pct)
-
     return {
         "plan_tier": org.get("rate_limit_tier"),
         "extra_usage_enabled": bool(spend.get("enabled")),
         "extra_usage_used_usd": round(float(used_usd), 2),
         "extra_usage_limit_usd": round(float(limit_usd), 2) if limit_usd is not None else None,
-        "model_windows": windows,
+        "scoped_windows": windows_from_limits(usage.get("limits")),
     }
 
 
@@ -243,9 +240,11 @@ def _poll_once(token: str) -> UsageSample:
             # K1: enrich with the OAuth usage + profile endpoints (plan tier,
             # extra-usage spend, per-model windows) on the same client/cadence.
             # Non-fatal: any failure leaves the header-derived sample intact.
+            # raise_for_status: an error body parses as JSON too, and would read
+            # as "no scoped windows" rather than "didn't find out".
             try:
-                usage = http.get(USAGE_URL, headers=headers).json()
-                profile = http.get(PROFILE_URL, headers=headers).json()
+                usage = http.get(USAGE_URL, headers=headers).raise_for_status().json()
+                profile = http.get(PROFILE_URL, headers=headers).raise_for_status().json()
                 for k, v in usage_fields_from_json(usage, profile).items():
                     setattr(sample, k, v)
             except (httpx.HTTPError, ValueError, TypeError):
