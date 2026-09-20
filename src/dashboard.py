@@ -92,6 +92,7 @@ import theme
 from color_picker import ColorPicker
 from usage_history import UsageHistory
 from approaching_notify import ApproachingNotifier
+from auth_notify import AuthNotifier
 from reset_notify import ResetDecision, ResetNotifier
 import update_check
 from update_check import UpdateChecker
@@ -2162,6 +2163,16 @@ class SettingsPanel(QWidget):
         self.notify_check.toggled.connect(self._on_notify_toggled)
         layout.addWidget(self.notify_check)
 
+        self.auth_notify_check = QCheckBox("When usage can't be read (sign-in problem)")
+        self.auth_notify_check.setChecked(app_settings.get_auth_notify())
+        self.auth_notify_check.toggled.connect(self._on_auth_notify_toggled)
+        self.auth_notify_check.setToolTip(
+            "The session shelf keeps working without a token, so a sign-in "
+            "problem is easy to miss. Fires once when it happens and once when "
+            "it recovers."
+        )
+        layout.addWidget(self.auth_notify_check)
+
         # Approaching-limit master + its threshold sub-box.
         self.approaching_check = QCheckBox("When approaching a limit")
         self.approaching_check.setChecked(app_settings.get_approaching_enabled())
@@ -2805,6 +2816,9 @@ class SettingsPanel(QWidget):
         if hasattr(win, "refresh_usage_bar_colors"):
             win.refresh_usage_bar_colors()
 
+    def _on_auth_notify_toggled(self, checked: bool) -> None:
+        app_settings.set_auth_notify(checked)
+
     def _on_approaching_toggled(self, checked: bool) -> None:
         app_settings.set_approaching_enabled(checked)
         self._sync_notify_subtoggles()
@@ -3395,6 +3409,7 @@ class Dashboard(QMainWindow):
         self._rate = RateGroupTracker()
         self._reset_notifier = ResetNotifier()
         self._approaching_notifier = ApproachingNotifier()
+        self._auth_notifier = AuthNotifier()
         # Idle poll back-off: track the last time a local session was active, and
         # whether the poll is currently slowed. Start "active" so a fresh launch
         # polls normally until the idle window elapses.
@@ -4464,6 +4479,12 @@ class Dashboard(QMainWindow):
             overage_enabled=app_settings.get_overage_alert_enabled(),
             scoped=scoped_windows.shown(self._scoped.windows, self._scoped_shown),
         )
+        # Dispatched here, before the not-ok early return below, because the
+        # alert that matters most fires on exactly those samples.
+        auth_alert = self._auth_notifier.observe(
+            s, enabled=app_settings.get_auth_notify())
+        if auth_alert is not None:
+            self._dispatch_auth_alert(auth_alert)
         self._last_sample = s
         self.usage_history.record(s)   # ring + throttled disk log (skips errors)
         self._maybe_backoff_poll()     # adjust cadence to local session activity
@@ -4900,6 +4921,16 @@ class Dashboard(QMainWindow):
         if _should_persist_size(self._fit_armed, self._fitting):
             self._remember_settled_size()
             self._size_save_timer.start()
+
+    def _dispatch_auth_alert(self, alert) -> None:
+        """Say once that usage can't be read, and once when it can again.
+
+        Goes through _deliver_alert like the reset and approaching alerts, so
+        it honours the channels the user already configured — including a
+        push-only setup, which is the one that reaches someone who is not
+        looking at the window. That is the whole point of this alert.
+        """
+        self._deliver_alert(alert.title, alert.body)
 
     def _apply_status_badge(self, status: str) -> None:
         """Show/hide the bottom-left rate-limit badge and reflow the window.
