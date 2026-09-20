@@ -188,3 +188,41 @@ def test_the_panel_never_blocks_on_a_credential_read(monkeypatch):
 
     assert seen, "control: is_expired was never called, so this proves nothing"
     assert all(b is False for b in seen), f"blocking read on the UI thread: {seen}"
+
+
+def _on_sample_calls() -> set:
+    """Attribute-call names inside Dashboard._on_sample, via the AST.
+
+    An AST walk rather than a substring search: it sees a real call, ignores
+    comments and docstrings, and survives the line being re-wrapped. Matching
+    source text would pass on a mention in a comment and fail on a reflow.
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parents[1] / "src" / "dashboard.py"
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    cls = next(n for n in ast.walk(tree)
+               if isinstance(n, ast.ClassDef) and n.name == "Dashboard")
+    fn = next(n for n in cls.body
+              if isinstance(n, ast.FunctionDef) and n.name == "_on_sample")
+    return {n.func.attr for n in ast.walk(fn)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+
+
+def test_the_ast_probe_can_see_a_call_that_is_definitely_there():
+    """Control. A broken walk and a missing call look identical without this."""
+    calls = _on_sample_calls()
+
+    assert "_apply_status_badge" in calls
+    assert "definitely_not_a_real_method" not in calls
+
+
+def test_the_poller_verdict_is_handed_to_settings():
+    """Otherwise the Connection tab renders a state it is never told about.
+
+    The wording branch has its own test in test_platform_wording, but that
+    passes with this call deleted — the panel would simply never learn the
+    refresh had been blocked, and would go on offering to wait for one.
+    """
+    assert "set_reauth_needed" in _on_sample_calls()
