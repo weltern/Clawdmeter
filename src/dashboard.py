@@ -71,6 +71,7 @@ from PySide6.QtWidgets import (
 import app_settings
 import macos_keychain
 import poll_cadence
+import reauth
 import run_at_startup
 import start_menu
 import token_refresh
@@ -80,6 +81,7 @@ from poller import (
     UsagePoller, UsageSample, credentials_path, DEFAULT_CREDENTIALS_PATH,
     token_source_description,
     STATUS_AUTH_EXPIRED, STATUS_HTTP_ERROR, STATUS_NO_TOKEN, STATUS_OFFLINE,
+    STATUS_REAUTH_NEEDED,
 )
 import macos_window
 import remote_notify
@@ -126,6 +128,7 @@ from uiutil import (ThemedPopup, bar_warn_thresholds, is_wayland, make_popup,
 # is what this table exists to prevent.
 FAILURE_BADGES = {
     STATUS_AUTH_EXPIRED: ("Token expired", "🔑", "block"),
+    STATUS_REAUTH_NEEDED: ("Sign in again", "🔑", "block"),
     STATUS_NO_TOKEN: ("No token found", "🔑", "block"),
     STATUS_HTTP_ERROR: ("API error", "⚠️", "warn"),
     STATUS_OFFLINE: ("Offline", "⚠️", "warn"),
@@ -1899,6 +1902,12 @@ class SettingsPanel(QWidget):
         self.refresh_token_btn = QPushButton("Refresh token now")
         self.refresh_token_btn.clicked.connect(self._on_refresh_token_clicked)
         layout.addWidget(self.refresh_token_btn)
+        # The escape hatch for when refreshing cannot work at all: a dead
+        # refresh token, or a macOS Keychain that Clawdmeter cannot write to.
+        # Always present so it is findable before it is needed.
+        self.reauth_btn = QPushButton("Sign in again")
+        self.reauth_btn.clicked.connect(self._on_reauth_clicked)
+        layout.addWidget(self.reauth_btn)
         self.refresh_token_status()
 
         layout = gen_layout
@@ -2473,6 +2482,10 @@ class SettingsPanel(QWidget):
             self.auto_refresh_check.blockSignals(True)
             self.auto_refresh_check.setChecked(False)
             self.auto_refresh_check.blockSignals(False)
+            # Signing in again is the ONE thing that does work on macOS, and it
+            # is exactly what the note above tells the user to do, so this stays
+            # live beside two greyed-out controls rather than joining them.
+            self._set_reauth_enabled(True, "")
         else:
             self.auto_refresh_check.setEnabled(True)
             self.auto_refresh_check.setToolTip("")
@@ -2487,6 +2500,13 @@ class SettingsPanel(QWidget):
                     "Disabled because your token is still valid — it refreshes "
                     "automatically when it expires."
                 )
+            # Same gate as the refresh button: offered whenever the token is in
+            # trouble, disabled WITH A REASON rather than hidden the rest of the
+            # time, so it can be found before it is needed.
+            self._set_reauth_enabled(needs_refresh, "" if needs_refresh else (
+                "Disabled because your token is still valid. Signing in again "
+                "replaces your Claude Code credentials."
+            ))
         if preserve_message:
             return          # controls are up to date; the message stays put
         # A full re-render replaces whatever set_token_status() put there, so
@@ -2626,6 +2646,21 @@ class SettingsPanel(QWidget):
         if self._on_refresh_token:
             self.set_token_status("Refreshing…")
             self._on_refresh_token()
+
+    def _set_reauth_enabled(self, enabled: bool, tooltip: str) -> None:
+        """Enable/disable the sign-in button, saying why when it is off.
+
+        A missing CLI does NOT disable it: clicking then reports the command to
+        run, which is more use than a dead control with no explanation.
+        """
+        self.reauth_btn.setEnabled(enabled)
+        self.reauth_btn.setToolTip(tooltip)
+
+    def _on_reauth_clicked(self) -> None:
+        # start_login never raises; a False comes back as a message that always
+        # ends in the command to run, so this cannot dead-end.
+        _started, message = reauth.start_login()
+        self.set_token_status(message)
 
     def _on_aot_toggled(self, checked: bool) -> None:
         app_settings.set_always_on_top(checked)
