@@ -79,6 +79,7 @@ from mood import GROUP_ANIMS, GROUP_NAMES, RateGroupTracker
 from poller import (
     UsagePoller, UsageSample, credentials_path, DEFAULT_CREDENTIALS_PATH,
     token_source_description,
+    STATUS_AUTH_EXPIRED, STATUS_HTTP_ERROR, STATUS_NO_TOKEN, STATUS_OFFLINE,
 )
 import macos_window
 import remote_notify
@@ -114,6 +115,21 @@ from transcript import (
 )
 from uiutil import (ThemedPopup, bar_warn_thresholds, is_wayland, make_popup,
                     format_minutes as _format_minutes, heat as _heat)
+
+
+# What the bottom-left badge says when a poll FAILS: {status: (text, icon, level)}.
+# `level` drives the QSS colour and only "warn" (amber) and "block" (red) are
+# styled, so nothing here may invent a third one.
+#
+# The split matters more than the wording: "Token expired" points at a fix the
+# user can carry out, "Offline" says to wait. Collapsing both into one message
+# is what this table exists to prevent.
+FAILURE_BADGES = {
+    STATUS_AUTH_EXPIRED: ("Token expired", "🔑", "block"),
+    STATUS_NO_TOKEN: ("No token found", "🔑", "block"),
+    STATUS_HTTP_ERROR: ("API error", "⚠️", "warn"),
+    STATUS_OFFLINE: ("Offline", "⚠️", "warn"),
+}
 
 
 # Stable tile id used in single-mascot mode (Settings: show multiple sessions
@@ -4418,7 +4434,10 @@ class Dashboard(QMainWindow):
         self._maybe_backoff_poll()     # adjust cadence to local session activity
         if not s.ok:
             self._apply_status_badge(s.status)
-            self._tray.setToolTip(f"Clawdmeter - {s.status}")
+            # Same wording as the badge, so the tray and the window can't
+            # disagree — and so the tooltip stops reading as a raw status slug.
+            failure = FAILURE_BADGES.get((s.status or "").lower())
+            self._tray.setToolTip(f"Clawdmeter - {failure[0] if failure else s.status}")
             self._last_tooltip = ""  # force a fresh stats tooltip on recovery
             return
 
@@ -4855,9 +4874,22 @@ class Dashboard(QMainWindow):
         container is hidden when there's nothing to say so the WEEKLY bar
         sits tight against the bottom; minimum window height grows by the
         badge row's footprint when it appears.
+
+        A FAILED poll carries one of poller's STATUS_* values instead, and those
+        are matched exactly, ahead of the substring checks. They have to say
+        something: before this, a failed poll fell through to the else branch
+        and CLEARED the badge, so an expired token left the 5h / 7d bars frozen
+        on their last good values with no explanation anywhere in the window.
         """
         s = (status or "").lower()
-        if "reject" in s or "block" in s:
+        failure = FAILURE_BADGES.get(s)
+        if failure:
+            text, icon, level = failure
+            self.status_text.setText(text)
+            self.status_icon.setText(icon)
+            self.status_text.setProperty("level", level)
+            has_badge = True
+        elif "reject" in s or "block" in s:
             self.status_text.setText("Limit reached")
             self.status_icon.setText("❌")
             self.status_text.setProperty("level", "block")

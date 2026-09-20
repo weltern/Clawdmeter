@@ -49,6 +49,21 @@ API_BODY = {
 DEFAULT_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 POLL_INTERVAL_SECONDS = 60
 
+# Status values for a poll that FAILED. The success path carries Anthropic's own
+# `anthropic-ratelimit-unified-5h-status` instead ("allowed", "allowed_warning",
+# "rejecting", ...), so these are deliberately distinct from those words — the
+# dashboard matches the rate-limit ones by substring.
+#
+# These exist because every failure used to collapse into a bare "error", which
+# the dashboard badge had no branch for and therefore rendered as *nothing*: an
+# expired token looked identical to a dashboard that had quietly stopped
+# updating. The failure kind is the whole difference between "re-authenticate"
+# and "wait for your network to come back".
+STATUS_NO_TOKEN = "no-token"
+STATUS_AUTH_EXPIRED = "auth-expired"
+STATUS_HTTP_ERROR = "http-error"
+STATUS_OFFLINE = "offline"
+
 
 @dataclass
 class UsageSample:
@@ -250,8 +265,18 @@ def _poll_once(token: str) -> UsageSample:
                     setattr(sample, k, v)
             except (httpx.HTTPError, ValueError, TypeError):
                 pass
+    except httpx.HTTPStatusError as exc:
+        # The server answered and refused. 401/403 is the OAuth token being
+        # expired or rejected — a specific state the user can actually fix, so
+        # it gets its own status rather than being flattened into "error".
+        # Caught before HTTPError below: HTTPStatusError is a subclass of it.
+        code = exc.response.status_code
+        status = STATUS_AUTH_EXPIRED if code in (401, 403) else STATUS_HTTP_ERROR
+        return UsageSample(0, 0, 0, 0, status, False, str(exc), now)
     except httpx.HTTPError as exc:
-        return UsageSample(0, 0, 0, 0, "error", False, str(exc), now)
+        # Transport-level: timeout, DNS failure, connection refused. Nothing is
+        # wrong with the token, so it must not read as an auth problem.
+        return UsageSample(0, 0, 0, 0, STATUS_OFFLINE, False, str(exc), now)
     # Sum the local transcripts' input+output over the 5h/7d windows — only when
     # the token display is on, so we don't scan files for nothing.
     if app_settings.get_show_token_usage():
@@ -347,7 +372,7 @@ class UsagePoller(QThread):
             token = read_token()
             if not token:
                 self.sample.emit(UsageSample(
-                    0, 0, 0, 0, "no-token", False,
+                    0, 0, 0, 0, STATUS_NO_TOKEN, False,
                     f"No token in {token_source_description()}", time.time(),
                 ))
             else:
