@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -153,6 +154,39 @@ def _poller_with(monkeypatch, outcome, expiry_ms=123):
                             outcome is Outcome.REFRESHED, "x", outcome=outcome))
     monkeypatch.setattr(token_refresh, "token_expiry_ms", lambda *a, **k: expiry_ms)
     return p
+
+
+def test_the_poller_refreshes_before_expiry_not_after(monkeypatch, tmp_path):
+    """The whole point of part one: don't wait for the token to be dead.
+
+    Twenty minutes of headroom, so this is nowhere near a clock boundary. The
+    control assertion below is what makes the test discriminating — under the
+    old rule is_expired() is False here and no refresh would have happened.
+    """
+    path = _creds(tmp_path, int((time.time() + 20 * 60) * 1000))
+    monkeypatch.setattr(poller, "credentials_path", lambda: path)
+
+    assert token_refresh.is_expired(path) is False, "control: not expired yet"
+
+    p = poller.UsagePoller()
+    calls = []
+    monkeypatch.setattr(p, "_do_refresh", lambda manual: calls.append(manual))
+    p._maybe_auto_refresh()
+
+    assert calls == [False]
+
+
+def test_the_poller_leaves_a_healthy_token_alone(monkeypatch, tmp_path):
+    """The other direction — refreshing early must not mean refreshing always."""
+    path = _creds(tmp_path, int((time.time() + 6 * 3600) * 1000))
+    monkeypatch.setattr(poller, "credentials_path", lambda: path)
+
+    p = poller.UsagePoller()
+    calls = []
+    monkeypatch.setattr(p, "_do_refresh", lambda manual: calls.append(manual))
+    p._maybe_auto_refresh()
+
+    assert calls == []
 
 
 def test_throttling_backs_off_far_past_the_ordinary_ceiling(monkeypatch):
