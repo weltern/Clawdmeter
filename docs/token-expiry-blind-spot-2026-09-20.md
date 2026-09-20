@@ -130,15 +130,40 @@ read as "all better now".
 ## Verification
 
 - `tests/test_failure_status_badge.py` (14), `tests/test_refresh_resilience.py`
-  (34), `tests/test_auth_notify.py` (17). Full suite: 682 passed.
-- Mutation-checked, 19/19 killed across two runs. Two survivors were found and
-  fixed rather than reported: nothing asserted that the *poller* calls
-  `needs_refresh()` (swapping it back for `is_expired()` left the suite green),
-  and the auth-status test parametrised over the very set it was checking, so
-  dropping a status just removed a case.
+  (36), `tests/test_auth_notify.py` (18), plus additions to
+  `tests/test_settings_tabs.py` and `tests/test_platform_wording.py`. Full
+  suite: 691 passed.
+- Mutation-checked across three runs, 29/29 killed. Four survivors were found
+  and fixed rather than reported, and each was the same shape — a fix nothing
+  could fail on:
+  - nothing asserted that the *poller* calls `needs_refresh()`, so swapping it
+    back for `is_expired()` left the suite green;
+  - the auth-status test parametrised over the very set it was checking, so
+    dropping a status just removed a case;
+  - the handler's call to `_sync_notify_subtoggles()` could be deleted, because
+    the test called the sync itself instead of driving the real signal;
+  - `_on_sample` could stop handing the poller's verdict to Settings, because
+    only the wording branch was covered.
 - The badge fix was revert-validated in both directions: blanking
   `FAILURE_BADGES` fails 5 tests, reverting the poller classification fails 5
   others, and the restored tree goes green.
+- End-to-end on the real failure, 2026-09-20: the badge rendered
+  `Token expired 🔑` against the genuinely expired token, and the **Sign in
+  again** button opened the browser and completed a Claude sign-in, after which
+  the poller picked the new token up on its own.
+
+## Review
+
+A code review of the branch found seven issues, all fixed in `aa7635f`. Two
+were the branch itself telling the user something untrue about its own
+behaviour — the shared delivery channels disappearing for anyone running only
+the auth alert, and Settings still offering to "wait for auto-refresh" in the
+one state where this change switches auto-refresh off permanently. The rest:
+403 claiming an expiry it had not established, the blocked-refresh state
+inferred from a nullable expiry so it failed to engage on the very input that
+triggers it, `auth_notify` importing `poller` against its own stated contract,
+a blocking credential read on the UI thread (pre-existing), and a dead
+`--email` parameter.
 
 ## Source references
 
