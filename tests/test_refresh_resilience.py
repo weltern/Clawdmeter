@@ -268,10 +268,40 @@ def test_login_argv_uses_the_subscription_flow(monkeypatch):
     assert argv == [r"C:\bin\claude.exe", "auth", "login", "--claudeai"]
 
 
-def test_login_argv_can_prefill_an_email(monkeypatch):
-    monkeypatch.setattr(reauth, "cli_path", lambda: "/usr/bin/claude")
+def test_the_block_engages_even_when_the_expiry_is_unknown(monkeypatch):
+    """The malformed-file case that produces a REJECTED in the first place.
 
-    assert reauth.login_argv("a@b.c")[-2:] == ["--email", "a@b.c"]
+    A credentials file with no refreshToken plausibly has no expiresAt either,
+    so token_expiry_ms returns None. Inferring "blocked" from that nullable
+    value meant the block silently did not engage on exactly the input that
+    triggers it.
+    """
+    p = _poller_with(monkeypatch, Outcome.REJECTED, expiry_ms=None)
+    p._do_refresh(manual=False)
+
+    assert p._reauth_needed() is True
+
+
+def test_a_file_that_never_had_an_expiry_stays_blocked(monkeypatch):
+    """None != None is False, so the block must not clear itself every poll."""
+    p = _poller_with(monkeypatch, Outcome.REJECTED, expiry_ms=None)
+    p._do_refresh(manual=False)
+
+    assert [p._reauth_needed() for _ in range(5)] == [True] * 5
+
+
+def test_is_expired_can_refuse_to_block_on_a_credential_read(tmp_path, monkeypatch):
+    """The UI thread must be able to ask without waiting on the macOS Keychain."""
+    seen = {}
+
+    def fake_expiry(path, *, blocking=True):
+        seen["blocking"] = blocking
+        return None
+
+    monkeypatch.setattr(token_refresh, "token_expiry_ms", fake_expiry)
+    token_refresh.is_expired(tmp_path / "x", blocking=False)
+
+    assert seen["blocking"] is False
 
 
 def test_a_missing_cli_still_tells_you_what_to_run(monkeypatch):

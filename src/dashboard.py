@@ -1755,6 +1755,10 @@ class SettingsPanel(QWidget):
         self._on_auto_hide_changed = on_auto_hide_changed
         self._on_refresh_token = on_refresh_token
         self._on_auto_refresh_changed = on_auto_refresh_changed
+        # Set by the Dashboard from the poll thread's verdict. The poller owns
+        # whether automatic refresh has been switched off; this panel must not
+        # promise one while it is.
+        self._reauth_needed = False
         self._on_poll_interval_changed = on_poll_interval_changed
         self._on_sessions_view_changed = on_sessions_view_changed
         self._on_token_view_changed = on_token_view_changed
@@ -2500,7 +2504,12 @@ class SettingsPanel(QWidget):
         else:
             self.auto_refresh_check.setEnabled(True)
             self.auto_refresh_check.setToolTip("")
-            needs_refresh = token_refresh.is_expired(path)
+            # blocking=False for the same reason as the `exp` read above: this
+            # runs on the UI thread during SettingsPanel construction, and a
+            # blocking macOS Keychain read here is what once hung the app
+            # before it drew anything. The comment above used to sit eleven
+            # lines over a call that blocked anyway.
+            needs_refresh = token_refresh.is_expired(path, blocking=False)
             self.refresh_token_btn.setEnabled(needs_refresh)
             if needs_refresh:
                 self.refresh_token_btn.setText("Refresh token now")
@@ -2554,7 +2563,14 @@ class SettingsPanel(QWidget):
                 self.token_status.setText(
                     f"Valid for ~{h}h {m}m — read from the login Keychain.")
             return
-        if secs <= 0:
+        if secs <= 0 and self._reauth_needed:
+            # Auto-refresh has been switched off by a rejected refresh token, so
+            # "wait for auto-refresh" would send the user waiting for something
+            # that is never coming — the same mistake the macOS branch above
+            # exists to avoid. Name the one remedy that can still work.
+            self.token_status.setText(
+                "Token expired and can't be refreshed — use Sign in again above.")
+        elif secs <= 0:
             self.token_status.setText("Token expired — refresh now, or wait for auto-refresh.")
         elif needs_refresh:
             self.token_status.setText("Token expiring — refresh now, or wait for auto-refresh.")
@@ -2657,6 +2673,20 @@ class SettingsPanel(QWidget):
         if self._on_refresh_token:
             self.set_token_status("Refreshing…")
             self._on_refresh_token()
+
+    def set_reauth_needed(self, needed: bool) -> None:
+        """Tell the panel that automatic refresh has been switched off.
+
+        Re-renders only on a CHANGE: this is fed from every poll, and an
+        unconditional re-render would wipe the held failure message that
+        set_token_status() puts up, once per poll, before it could be read.
+        """
+        needed = bool(needed)
+        if needed == self._reauth_needed:
+            return
+        self._reauth_needed = needed
+        if self.connection_tab_is_current():
+            self.refresh_token_status()
 
     def _set_reauth_enabled(self, enabled: bool, tooltip: str) -> None:
         """Enable/disable the sign-in button, saying why when it is off.
@@ -2818,6 +2848,7 @@ class SettingsPanel(QWidget):
 
     def _on_auth_notify_toggled(self, checked: bool) -> None:
         app_settings.set_auth_notify(checked)
+        self._sync_notify_subtoggles()   # this alert counts toward "any alert on"
 
     def _on_approaching_toggled(self, checked: bool) -> None:
         app_settings.set_approaching_enabled(checked)
@@ -2940,7 +2971,13 @@ class SettingsPanel(QWidget):
         self.approaching_box.setVisible(self.approaching_check.isChecked())
 
         # Shared "how" channels are relevant when any alert type is enabled.
-        any_on = self.notify_check.isChecked() or self.approaching_check.isChecked()
+        # The auth alert counts too: it delivers through these same channels,
+        # so leaving it out hid the "how" controls from anyone who had only
+        # that one on — while it went on firing toasts through settings they
+        # could no longer see.
+        any_on = (self.notify_check.isChecked()
+                  or self.auth_notify_check.isChecked()
+                  or self.approaching_check.isChecked())
         self.notify_how_box.setVisible(any_on)
 
         # Windows channel sub-box (sound + pop): only when shown + Windows on.
@@ -4465,6 +4502,9 @@ class Dashboard(QMainWindow):
         # for. Gated on the line being on screen -- opening the Connection tab
         # re-renders it anyway, so this only has to serve someone already
         # sitting on the page.
+        # Hand the poller's verdict to Settings before it re-renders, so the
+        # Connection tab can't promise an auto-refresh that has been stopped.
+        self.settings_panel.set_reauth_needed(s.status == STATUS_REAUTH_NEEDED)
         self._refresh_token_status_if_watched()
         if s.ok:
             self._observe_scoped(s)

@@ -22,23 +22,28 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from poller import STATUS_AUTH_EXPIRED, STATUS_NO_TOKEN, STATUS_REAUTH_NEEDED
-
 if TYPE_CHECKING:  # type-only — keeps this module free of Qt/httpx at runtime
     from poller import UsageSample
 
 # Statuses that mean "we cannot read usage and only you can fix it".
+#
+# Written as literals rather than imported from poller ON PURPOSE. Importing
+# poller for three strings would drag PySide6 and httpx into a module that
+# says, two paragraphs up, that it has neither — and would make this module
+# unimportable from poller, which is where the statuses live and the natural
+# place for a future caller to be. `test_the_statuses_match_the_pollers_own_names`
+# fails if either side is renamed, which is the guarantee the import was for.
 AUTH_FAILURE_STATUSES = frozenset({
-    STATUS_AUTH_EXPIRED, STATUS_REAUTH_NEEDED, STATUS_NO_TOKEN,
+    "auth-expired", "reauth-needed", "no-token",
 })
 
 _LOST_BODIES = {
-    STATUS_AUTH_EXPIRED:
+    "auth-expired":
         "The Claude token expired. Clawdmeter is trying to refresh it.",
-    STATUS_REAUTH_NEEDED:
+    "reauth-needed":
         "The Claude token expired and can't be refreshed — sign in again "
         "from Settings, or run: claude auth login",
-    STATUS_NO_TOKEN:
+    "no-token":
         "No Claude credentials were found, so usage can't be read.",
 }
 

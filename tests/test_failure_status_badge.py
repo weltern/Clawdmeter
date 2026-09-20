@@ -43,7 +43,10 @@ def _patch_transport(monkeypatch, handler) -> None:
 
 @pytest.mark.parametrize("code, expected", [
     (401, poller.STATUS_AUTH_EXPIRED),
-    (403, poller.STATUS_AUTH_EXPIRED),
+    # 403 is forbidden, not expired: a revoked token or an org policy. Claiming
+    # an expiry would assert something unestablished and point at a refresh
+    # that cannot help, so it goes straight to "sign in again".
+    (403, poller.STATUS_REAUTH_NEEDED),
     (429, poller.STATUS_HTTP_ERROR),
     (500, poller.STATUS_HTTP_ERROR),
 ])

@@ -133,28 +133,40 @@ def token_expiry_ms(path: Path, *, blocking: bool = True) -> int | None:
     return None
 
 
-def _seconds_until_expiry(path: Path, *, now: float | None = None) -> float | None:
+def _seconds_until_expiry(path: Path, *, now: float | None = None,
+                          blocking: bool = True) -> float | None:
     """Seconds left on the stored token, or None when the expiry is unknown.
 
     ``now`` is injectable so boundary tests can pin the clock. Reading the clock
     twice around a comparison is how a test that sits exactly on the boundary
     fails one run in twenty-five.
+
+    ``blocking`` is passed straight through to token_expiry_ms, so a UI-thread
+    caller can refuse to wait on the macOS Keychain. See is_expired().
     """
-    exp = token_expiry_ms(path)
+    exp = token_expiry_ms(path, blocking=blocking)
     if exp is None:
         return None
     return exp / 1000.0 - (time.time() if now is None else now)
 
 
 def is_expired(path: Path, skew_seconds: int = EXPIRY_SKEW_SECONDS,
-               *, now: float | None = None) -> bool:
+               *, now: float | None = None, blocking: bool = True) -> bool:
     """Is the token dead RIGHT NOW (within a small skew)?
 
     This answers the Settings question — "is the thing currently broken" — and
     must not be widened, or the panel starts calling a healthy token expired.
     The poller asks a different question; see needs_refresh().
+
+    Pass ``blocking=False`` from the UI thread. The macOS Keychain read this
+    reaches can hang indefinitely on an authorisation dialog, and this function
+    is called while SettingsPanel is being constructed — the case that once hung
+    the app before it drew anything. Non-blocking returns None until the poller
+    has cached a read on its worker, which reads here as "not expired": the
+    conservative answer, since it only leaves a remedy button disabled for a
+    moment rather than offering one for a token that is fine.
     """
-    left = _seconds_until_expiry(path, now=now)
+    left = _seconds_until_expiry(path, now=now, blocking=blocking)
     if left is None:
         return False  # unknown expiry -> don't trigger a refresh
     return left <= skew_seconds

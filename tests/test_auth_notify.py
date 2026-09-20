@@ -131,3 +131,26 @@ def test_the_statuses_match_the_pollers_own_names():
     assert auth_notify.AUTH_FAILURE_STATUSES == {
         poller.STATUS_AUTH_EXPIRED, poller.STATUS_REAUTH_NEEDED, poller.STATUS_NO_TOKEN,
     }
+
+
+def test_auth_notify_does_not_import_qt_or_httpx():
+    """The module docstring promises this; a `from poller import ...` broke it.
+
+    Importing poller for three string constants dragged PySide6 and httpx into
+    a module that claims to need neither, and made this module unimportable
+    from poller — where the statuses live and where a future caller belongs.
+    """
+    import subprocess
+    import sys as _sys
+
+    src = os.path.join(os.path.dirname(__file__), "..", "src")
+    probe = (
+        "import sys; sys.path.insert(0, %r);"
+        "import auth_notify;"
+        "loaded = [m for m in ('PySide6', 'httpx', 'poller') if m in sys.modules];"
+        "print(','.join(loaded))" % src
+    )
+    out = subprocess.run([_sys.executable, "-c", probe],
+                         capture_output=True, text=True, check=True)
+
+    assert out.stdout.strip() == "", f"auth_notify pulled in {out.stdout.strip()}"

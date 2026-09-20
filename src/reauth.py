@@ -58,25 +58,21 @@ def is_available() -> bool:
     return cli_path() is not None
 
 
-def login_argv(email: str | None = None) -> list[str] | None:
+def login_argv() -> list[str] | None:
     """The exact command a sign-in runs, or None when the CLI is missing."""
     exe = cli_path()
     if exe is None:
         return None
-    argv = [exe, *LOGIN_ARGS]
-    if email:
-        argv += ["--email", email]
-    return argv
+    return [exe, *LOGIN_ARGS]
 
 
-def login_command_text(email: str | None = None) -> str:
+def login_command_text() -> str:
     """The command to show the user when we cannot run it for them.
 
     Deliberately the bare `claude ...` form rather than the resolved absolute
     path: this is for a human to type, and it is what the docs would say.
     """
-    tail = " ".join(LOGIN_ARGS)
-    return f"{CLI_NAME} {tail}" + (f" --email {email}" if email else "")
+    return f"{CLI_NAME} " + " ".join(LOGIN_ARGS)
 
 
 def _spawn_windows(argv: list[str]) -> None:
@@ -110,7 +106,7 @@ def _spawn_linux(argv: list[str]) -> None:
     raise FileNotFoundError("no terminal emulator found")
 
 
-def start_login(email: str | None = None) -> tuple[bool, str]:
+def start_login() -> tuple[bool, str]:
     """Open a sign-in. Returns (started, message) — never raises.
 
     A False here is not a failure to report as a bug: the message is written to
@@ -118,11 +114,11 @@ def start_login(email: str | None = None) -> tuple[bool, str]:
     because a re-auth path that dead-ends is the same defect this whole feature
     exists to remove.
     """
-    argv = login_argv(email)
+    argv = login_argv()
     if argv is None:
         return False, (
             "Claude Code isn't on PATH. Sign in with: "
-            f"{login_command_text(email)}"
+            f"{login_command_text()}"
         )
     try:
         if _is_windows():
@@ -134,7 +130,7 @@ def start_login(email: str | None = None) -> tuple[bool, str]:
     except (OSError, ValueError) as exc:
         return False, (
             f"Couldn't open a terminal ({exc}). Sign in with: "
-            f"{login_command_text(email)}"
+            f"{login_command_text()}"
         )
     return True, (
         "Signing in with Claude Code — finish in the window that just opened. "

@@ -145,7 +145,7 @@ def _token_line(monkeypatch, *, keychain: bool, secs_left: float) -> str:
     monkeypatch.setattr(token_refresh, "_macos_keychain_active", lambda: keychain)
     monkeypatch.setattr(token_refresh, "token_expiry_ms",
                         lambda _p, **_kw: (_time.time() + secs_left) * 1000)
-    monkeypatch.setattr(token_refresh, "is_expired", lambda _p: secs_left <= 0)
+    monkeypatch.setattr(token_refresh, "is_expired", lambda _p, **_kw: secs_left <= 0)
     host = QWidget()
     panel = dashboard.SettingsPanel(host, lambda *_a: None, lambda *_a: None)
     try:
@@ -211,3 +211,43 @@ def test_the_hint_and_the_checkbox_use_the_same_verb(monkeypatch):
         for t in startup:
             assert verb in t, f"{platform}: {t!r} should say {verb!r}"
             assert wrong not in t, f"{platform}: {t!r} should not say {wrong!r}"
+
+
+def _blocked_token_line(monkeypatch, *, reauth_needed: bool) -> str:
+    """The expired-token line once the poller reports a dead refresh token."""
+    import time as _time
+
+    import token_refresh
+    monkeypatch.setattr(token_refresh, "_macos_keychain_active", lambda: False)
+    monkeypatch.setattr(token_refresh, "token_expiry_ms",
+                        lambda _p, **_kw: (_time.time() - 60) * 1000)
+    monkeypatch.setattr(token_refresh, "is_expired", lambda _p, **_kw: True)
+    host = QWidget()
+    panel = dashboard.SettingsPanel(host, lambda *_a: None, lambda *_a: None)
+    try:
+        panel.set_reauth_needed(reauth_needed)
+        panel.refresh_token_status()
+        return panel.token_status.text()
+    finally:
+        panel.deleteLater()
+        host.deleteLater()
+
+
+def test_a_dead_refresh_token_is_not_told_to_wait_for_auto_refresh(monkeypatch):
+    """Auto-refresh is switched off in this state; promising one sends them waiting.
+
+    Same defect the macOS branch above guards against, in the branch that has
+    the users. The control below is what makes this discriminating: the
+    ordinary expiry DOES still offer to wait, so the wording has to change on
+    the flag rather than everywhere.
+    """
+    line = _blocked_token_line(monkeypatch, reauth_needed=True)
+
+    assert "auto-refresh" not in line.lower()
+    assert "sign in again" in line.lower()
+
+
+def test_an_ordinary_expiry_still_offers_to_wait(monkeypatch):
+    line = _blocked_token_line(monkeypatch, reauth_needed=False)
+
+    assert "auto-refresh" in line.lower()

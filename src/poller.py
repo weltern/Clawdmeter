@@ -270,12 +270,22 @@ def _poll_once(token: str) -> UsageSample:
             except (httpx.HTTPError, ValueError, TypeError):
                 pass
     except httpx.HTTPStatusError as exc:
-        # The server answered and refused. 401/403 is the OAuth token being
-        # expired or rejected — a specific state the user can actually fix, so
-        # it gets its own status rather than being flattened into "error".
-        # Caught before HTTPError below: HTTPStatusError is a subclass of it.
+        # The server answered and refused. Caught before HTTPError below:
+        # HTTPStatusError is a subclass of it.
+        #
+        # 401 and 403 are NOT the same thing and must not claim to be. 401 is
+        # the token having expired, which a refresh fixes by itself. 403 is
+        # forbidden — a revoked token, or an org policy — where asserting an
+        # expiry would state something unestablished and send the user to fix
+        # the wrong thing. "Sign in again" is true under either reading of a
+        # 403, and it is the only remedy this app can offer for one.
         code = exc.response.status_code
-        status = STATUS_AUTH_EXPIRED if code in (401, 403) else STATUS_HTTP_ERROR
+        if code == 401:
+            status = STATUS_AUTH_EXPIRED
+        elif code == 403:
+            status = STATUS_REAUTH_NEEDED
+        else:
+            status = STATUS_HTTP_ERROR
         return UsageSample(0, 0, 0, 0, status, False, str(exc), now)
     except httpx.HTTPError as exc:
         # Transport-level: timeout, DNS failure, connection refused. Nothing is
@@ -320,10 +330,16 @@ class UsagePoller(QThread):
         self._manual_refresh = False
         self._last_refresh_attempt = 0.0
         self._cooldown = self.REFRESH_COOLDOWN_MIN
-        # Expiry of the credentials a REJECTED refresh was made against. While
-        # this is set, automatic refreshes are off: the stored refresh token is
-        # dead and retrying it can only fail. It clears by itself the moment the
-        # file's expiry changes, i.e. somebody signed in again.
+        # Whether a REJECTED refresh has switched automatic refreshes off: the
+        # stored refresh token is dead and retrying it can only fail. Its own
+        # boolean, NOT inferred from the expiry below, because that expiry is
+        # legitimately None for a credentials file with no `expiresAt` — which
+        # is exactly the malformed-file case that produces a REJECTED. Inferring
+        # the state from a nullable value made the block silently not engage.
+        self._refresh_blocked = False
+        # The expiry the block was taken against (may be None when unknown).
+        # A CHANGE here means somebody signed in again, which clears the block
+        # without anything having to notify us.
         self._blocked_expiry_ms: int | None = None
 
     def stop(self) -> None:
@@ -357,11 +373,13 @@ class UsagePoller(QThread):
 
         if outcome is Outcome.REFRESHED:
             self._cooldown = self.REFRESH_COOLDOWN_MIN
+            self._refresh_blocked = False
             self._blocked_expiry_ms = None
         elif outcome is Outcome.REJECTED:
             # Dead refresh token. Stop attempting: it cannot succeed, and each
             # try is another request against a rate limiter we may already be
             # behind. A manual attempt still gets through _do_refresh directly.
+            self._refresh_blocked = True
             self._blocked_expiry_ms = token_refresh.token_expiry_ms(credentials_path())
         elif manual:
             pass                       # the user asked; don't punish them with backoff
@@ -394,10 +412,14 @@ class UsagePoller(QThread):
         signing in again writes a new expiry, and the next poll resumes without
         anything having to notify us.
         """
-        if self._blocked_expiry_ms is None:
+        if not self._refresh_blocked:
             return False
         if token_refresh.token_expiry_ms(credentials_path()) != self._blocked_expiry_ms:
-            self._blocked_expiry_ms = None   # new credentials arrived
+            # New credentials arrived. Note this is correct when BOTH are None
+            # (None != None is False), so a file that never had an expiry stays
+            # blocked rather than silently unblocking on every poll.
+            self._refresh_blocked = False
+            self._blocked_expiry_ms = None
             return False
         return True
 
