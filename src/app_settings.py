@@ -49,6 +49,7 @@ KEY_RESET_NOTIFY_PUSH_GOTIFY_URL = "notify/reset_push_gotify_url"
 KEY_RESET_NOTIFY_PUSH_GOTIFY_TOKEN = "notify/reset_push_gotify_token"
 KEY_RESET_NOTIFY_PUSH_CHANNELS = "notify/reset_push_channels"
 KEY_APPROACHING_ENABLED = "notify/approaching_enabled"
+KEY_AUTH_NOTIFY = "notify/auth_enabled"
 KEY_APPROACHING_SESSION_PCT = "notify/approaching_session_pct"
 KEY_APPROACHING_WEEKLY_PCT = "notify/approaching_weekly_pct"
 KEY_OVERAGE_ALERT_ENABLED = "notify/overage_alert_enabled"
@@ -545,6 +546,21 @@ def get_approaching_enabled() -> bool:
 
 def set_approaching_enabled(on: bool) -> None:
     _settings().setValue(KEY_APPROACHING_ENABLED, bool(on))
+
+
+def get_auth_notify() -> bool:
+    # Default ON, unlike the approaching alert. That one is a judgement call
+    # about how close is too close; this one means the dashboard has stopped
+    # telling the truth and cannot fix itself — the case for defaulting quiet
+    # is the case for not noticing for a day and a half.
+    v = _settings().value(KEY_AUTH_NOTIFY, True)
+    if isinstance(v, str):
+        return v.lower() in ("true", "1", "yes")
+    return bool(v)
+
+
+def set_auth_notify(on: bool) -> None:
+    _settings().setValue(KEY_AUTH_NOTIFY, bool(on))
 
 
 def _clamp_approaching_pct(value: int) -> int:

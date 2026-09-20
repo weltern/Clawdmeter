@@ -28,6 +28,7 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 import macos_keychain
@@ -38,7 +39,28 @@ CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 REFRESH_HEADERS = {"Content-Type": "application/json", "User-Agent": "anthropic"}
 
 EXPIRY_SKEW_SECONDS = 120  # treat the token as expired this many seconds early
+# How far AHEAD of expiry the poller refreshes. Deliberately much larger than
+# the skew above: that one answers "is it broken now", this one answers "renew
+# it while we still can". 30 minutes leaves room for a throttled endpoint to
+# be retried several times before anything the user can see breaks.
+REFRESH_LEAD_SECONDS = 1800
 BACKUP_SUFFIX = ".clawdmeter-bak"
+
+
+class RefreshOutcome(str, Enum):
+    """WHY a refresh ended the way it did — the bare ok/not-ok is not enough.
+
+    The distinction that matters is THROTTLED vs REJECTED. Both look like "the
+    refresh failed", but only one can ever succeed on a retry: a rejected
+    refresh token is dead, and retrying it forever both never works and keeps
+    feeding the endpoint's rate limiter. Callers key their backoff off this.
+    """
+
+    REFRESHED = "refreshed"
+    THROTTLED = "throttled"      # 429 — the endpoint is rate-limiting us
+    REJECTED = "rejected"        # 400/401 — the refresh token itself is dead
+    UNREACHABLE = "unreachable"  # transport: timeout, DNS, connection refused
+    ERROR = "error"              # anything else, including local file problems
 
 
 @dataclass
@@ -48,6 +70,8 @@ class RefreshResult:
     http_status: int | None = None
     new_expiry_ms: int | None = None
     reverted: bool = False
+    # Last so every existing positional construction still works.
+    outcome: RefreshOutcome = RefreshOutcome.ERROR
 
 
 def _oauth_block(data: dict) -> dict | None:
@@ -109,11 +133,59 @@ def token_expiry_ms(path: Path, *, blocking: bool = True) -> int | None:
     return None
 
 
-def is_expired(path: Path, skew_seconds: int = EXPIRY_SKEW_SECONDS) -> bool:
-    exp = token_expiry_ms(path)
+def _seconds_until_expiry(path: Path, *, now: float | None = None,
+                          blocking: bool = True) -> float | None:
+    """Seconds left on the stored token, or None when the expiry is unknown.
+
+    ``now`` is injectable so boundary tests can pin the clock. Reading the clock
+    twice around a comparison is how a test that sits exactly on the boundary
+    fails one run in twenty-five.
+
+    ``blocking`` is passed straight through to token_expiry_ms, so a UI-thread
+    caller can refuse to wait on the macOS Keychain. See is_expired().
+    """
+    exp = token_expiry_ms(path, blocking=blocking)
     if exp is None:
+        return None
+    return exp / 1000.0 - (time.time() if now is None else now)
+
+
+def is_expired(path: Path, skew_seconds: int = EXPIRY_SKEW_SECONDS,
+               *, now: float | None = None, blocking: bool = True) -> bool:
+    """Is the token dead RIGHT NOW (within a small skew)?
+
+    This answers the Settings question — "is the thing currently broken" — and
+    must not be widened, or the panel starts calling a healthy token expired.
+    The poller asks a different question; see needs_refresh().
+
+    Pass ``blocking=False`` from the UI thread. The macOS Keychain read this
+    reaches can hang indefinitely on an authorisation dialog, and this function
+    is called while SettingsPanel is being constructed — the case that once hung
+    the app before it drew anything. Non-blocking returns None until the poller
+    has cached a read on its worker, which reads here as "not expired": the
+    conservative answer, since it only leaves a remedy button disabled for a
+    moment rather than offering one for a token that is fine.
+    """
+    left = _seconds_until_expiry(path, now=now, blocking=blocking)
+    if left is None:
         return False  # unknown expiry -> don't trigger a refresh
-    return time.time() * 1000 >= (exp - skew_seconds * 1000)
+    return left <= skew_seconds
+
+
+def needs_refresh(path: Path, lead_seconds: int = REFRESH_LEAD_SECONDS,
+                  *, now: float | None = None) -> bool:
+    """Should the poller refresh YET? True well BEFORE the token dies.
+
+    Refreshing only once the token had already expired left a window where
+    every poll 401'd and recovery depended on the token endpoint answering
+    right then — an endpoint that throttles hard. Refreshing early costs
+    nothing extra: it is the same one refresh per token lifetime, just taken
+    while there is still a working token to fall back on.
+    """
+    left = _seconds_until_expiry(path, now=now)
+    if left is None:
+        return False
+    return left <= lead_seconds
 
 
 def _backup_path(path: Path) -> Path:
@@ -161,7 +233,8 @@ def _write_tokens_safely(path: Path, original_raw: str, data: dict,
         backup.unlink()
     except OSError:
         pass
-    return RefreshResult(True, "Token refreshed", 200)
+    return RefreshResult(True, "Token refreshed", 200,
+                         outcome=RefreshOutcome.REFRESHED)
 
 
 def refresh(path: Path, *, timeout: float = 20.0) -> RefreshResult:
@@ -187,7 +260,10 @@ def refresh(path: Path, *, timeout: float = 20.0) -> RefreshResult:
 
     blk = _oauth_block(data)
     if not blk or not isinstance(blk.get("refreshToken"), str):
-        return RefreshResult(False, "No refresh token found in credentials")
+        # Nothing to refresh WITH. Only signing in again produces one, so this
+        # is the same dead end as a server-side rejection, not a retryable slip.
+        return RefreshResult(False, "No refresh token found in credentials",
+                             outcome=RefreshOutcome.REJECTED)
     refresh_tok = blk["refreshToken"]
 
     # httpx imported lazily so this module stays importable/testable without it.
@@ -202,14 +278,23 @@ def refresh(path: Path, *, timeout: float = 20.0) -> RefreshResult:
         with httpx.Client(timeout=timeout) as http:
             resp = http.post(OAUTH_TOKEN_URL, headers=REFRESH_HEADERS, json=body)
     except httpx.HTTPError as exc:
-        return RefreshResult(False, f"Refresh request failed: {exc}")
+        return RefreshResult(False, f"Refresh request failed: {exc}",
+                             outcome=RefreshOutcome.UNREACHABLE)
 
     if resp.status_code == 429:
-        return RefreshResult(False, "Rate limited by token endpoint — backing off", 429)
+        return RefreshResult(False, "Rate limited by token endpoint — backing off", 429,
+                             outcome=RefreshOutcome.THROTTLED)
+    if resp.status_code in (400, 401):
+        # The server read the refresh token and refused it: expired, or already
+        # rotated by whoever refreshed last. No amount of retrying fixes that.
+        return RefreshResult(
+            False, f"Refresh token rejected (HTTP {resp.status_code}) — sign in again",
+            resp.status_code, outcome=RefreshOutcome.REJECTED,
+        )
     if resp.status_code != 200:
         return RefreshResult(
-            False, f"Refresh rejected (HTTP {resp.status_code}) — re-login may be needed",
-            resp.status_code,
+            False, f"Refresh failed (HTTP {resp.status_code})",
+            resp.status_code, outcome=RefreshOutcome.ERROR,
         )
 
     try:

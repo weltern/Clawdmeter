@@ -71,6 +71,7 @@ from PySide6.QtWidgets import (
 import app_settings
 import macos_keychain
 import poll_cadence
+import reauth
 import run_at_startup
 import start_menu
 import token_refresh
@@ -79,6 +80,8 @@ from mood import GROUP_ANIMS, GROUP_NAMES, RateGroupTracker
 from poller import (
     UsagePoller, UsageSample, credentials_path, DEFAULT_CREDENTIALS_PATH,
     token_source_description,
+    STATUS_AUTH_EXPIRED, STATUS_HTTP_ERROR, STATUS_NO_TOKEN, STATUS_OFFLINE,
+    STATUS_REAUTH_NEEDED,
 )
 import macos_window
 import remote_notify
@@ -89,6 +92,7 @@ import theme
 from color_picker import ColorPicker
 from usage_history import UsageHistory
 from approaching_notify import ApproachingNotifier
+from auth_notify import AuthNotifier
 from reset_notify import ResetDecision, ResetNotifier
 import update_check
 from update_check import UpdateChecker
@@ -114,6 +118,22 @@ from transcript import (
 )
 from uiutil import (ThemedPopup, bar_warn_thresholds, is_wayland, make_popup,
                     format_minutes as _format_minutes, heat as _heat)
+
+
+# What the bottom-left badge says when a poll FAILS: {status: (text, icon, level)}.
+# `level` drives the QSS colour and only "warn" (amber) and "block" (red) are
+# styled, so nothing here may invent a third one.
+#
+# The split matters more than the wording: "Token expired" points at a fix the
+# user can carry out, "Offline" says to wait. Collapsing both into one message
+# is what this table exists to prevent.
+FAILURE_BADGES = {
+    STATUS_AUTH_EXPIRED: ("Token expired", "🔑", "block"),
+    STATUS_REAUTH_NEEDED: ("Sign in again", "🔑", "block"),
+    STATUS_NO_TOKEN: ("No token found", "🔑", "block"),
+    STATUS_HTTP_ERROR: ("API error", "⚠️", "warn"),
+    STATUS_OFFLINE: ("Offline", "⚠️", "warn"),
+}
 
 
 # Stable tile id used in single-mascot mode (Settings: show multiple sessions
@@ -1735,6 +1755,10 @@ class SettingsPanel(QWidget):
         self._on_auto_hide_changed = on_auto_hide_changed
         self._on_refresh_token = on_refresh_token
         self._on_auto_refresh_changed = on_auto_refresh_changed
+        # Set by the Dashboard from the poll thread's verdict. The poller owns
+        # whether automatic refresh has been switched off; this panel must not
+        # promise one while it is.
+        self._reauth_needed = False
         self._on_poll_interval_changed = on_poll_interval_changed
         self._on_sessions_view_changed = on_sessions_view_changed
         self._on_token_view_changed = on_token_view_changed
@@ -1883,6 +1907,12 @@ class SettingsPanel(QWidget):
         self.refresh_token_btn = QPushButton("Refresh token now")
         self.refresh_token_btn.clicked.connect(self._on_refresh_token_clicked)
         layout.addWidget(self.refresh_token_btn)
+        # The escape hatch for when refreshing cannot work at all: a dead
+        # refresh token, or a macOS Keychain that Clawdmeter cannot write to.
+        # Always present so it is findable before it is needed.
+        self.reauth_btn = QPushButton("Sign in again")
+        self.reauth_btn.clicked.connect(self._on_reauth_clicked)
+        layout.addWidget(self.reauth_btn)
         self.refresh_token_status()
 
         layout = gen_layout
@@ -2136,6 +2166,16 @@ class SettingsPanel(QWidget):
         self.notify_check.setChecked(app_settings.get_reset_notify())
         self.notify_check.toggled.connect(self._on_notify_toggled)
         layout.addWidget(self.notify_check)
+
+        self.auth_notify_check = QCheckBox("When usage can't be read (sign-in problem)")
+        self.auth_notify_check.setChecked(app_settings.get_auth_notify())
+        self.auth_notify_check.toggled.connect(self._on_auth_notify_toggled)
+        self.auth_notify_check.setToolTip(
+            "The session shelf keeps working without a token, so a sign-in "
+            "problem is easy to miss. Fires once when it happens and once when "
+            "it recovers."
+        )
+        layout.addWidget(self.auth_notify_check)
 
         # Approaching-limit master + its threshold sub-box.
         self.approaching_check = QCheckBox("When approaching a limit")
@@ -2457,10 +2497,19 @@ class SettingsPanel(QWidget):
             self.auto_refresh_check.blockSignals(True)
             self.auto_refresh_check.setChecked(False)
             self.auto_refresh_check.blockSignals(False)
+            # Signing in again is the ONE thing that does work on macOS, and it
+            # is exactly what the note above tells the user to do, so this stays
+            # live beside two greyed-out controls rather than joining them.
+            self._set_reauth_enabled(True, "")
         else:
             self.auto_refresh_check.setEnabled(True)
             self.auto_refresh_check.setToolTip("")
-            needs_refresh = token_refresh.is_expired(path)
+            # blocking=False for the same reason as the `exp` read above: this
+            # runs on the UI thread during SettingsPanel construction, and a
+            # blocking macOS Keychain read here is what once hung the app
+            # before it drew anything. The comment above used to sit eleven
+            # lines over a call that blocked anyway.
+            needs_refresh = token_refresh.is_expired(path, blocking=False)
             self.refresh_token_btn.setEnabled(needs_refresh)
             if needs_refresh:
                 self.refresh_token_btn.setText("Refresh token now")
@@ -2471,6 +2520,13 @@ class SettingsPanel(QWidget):
                     "Disabled because your token is still valid — it refreshes "
                     "automatically when it expires."
                 )
+            # Same gate as the refresh button: offered whenever the token is in
+            # trouble, disabled WITH A REASON rather than hidden the rest of the
+            # time, so it can be found before it is needed.
+            self._set_reauth_enabled(needs_refresh, "" if needs_refresh else (
+                "Disabled because your token is still valid. Signing in again "
+                "replaces your Claude Code credentials."
+            ))
         if preserve_message:
             return          # controls are up to date; the message stays put
         # A full re-render replaces whatever set_token_status() put there, so
@@ -2507,7 +2563,14 @@ class SettingsPanel(QWidget):
                 self.token_status.setText(
                     f"Valid for ~{h}h {m}m — read from the login Keychain.")
             return
-        if secs <= 0:
+        if secs <= 0 and self._reauth_needed:
+            # Auto-refresh has been switched off by a rejected refresh token, so
+            # "wait for auto-refresh" would send the user waiting for something
+            # that is never coming — the same mistake the macOS branch above
+            # exists to avoid. Name the one remedy that can still work.
+            self.token_status.setText(
+                "Token expired and can't be refreshed — use Sign in again above.")
+        elif secs <= 0:
             self.token_status.setText("Token expired — refresh now, or wait for auto-refresh.")
         elif needs_refresh:
             self.token_status.setText("Token expiring — refresh now, or wait for auto-refresh.")
@@ -2610,6 +2673,35 @@ class SettingsPanel(QWidget):
         if self._on_refresh_token:
             self.set_token_status("Refreshing…")
             self._on_refresh_token()
+
+    def set_reauth_needed(self, needed: bool) -> None:
+        """Tell the panel that automatic refresh has been switched off.
+
+        Re-renders only on a CHANGE: this is fed from every poll, and an
+        unconditional re-render would wipe the held failure message that
+        set_token_status() puts up, once per poll, before it could be read.
+        """
+        needed = bool(needed)
+        if needed == self._reauth_needed:
+            return
+        self._reauth_needed = needed
+        if self.connection_tab_is_current():
+            self.refresh_token_status()
+
+    def _set_reauth_enabled(self, enabled: bool, tooltip: str) -> None:
+        """Enable/disable the sign-in button, saying why when it is off.
+
+        A missing CLI does NOT disable it: clicking then reports the command to
+        run, which is more use than a dead control with no explanation.
+        """
+        self.reauth_btn.setEnabled(enabled)
+        self.reauth_btn.setToolTip(tooltip)
+
+    def _on_reauth_clicked(self) -> None:
+        # start_login never raises; a False comes back as a message that always
+        # ends in the command to run, so this cannot dead-end.
+        _started, message = reauth.start_login()
+        self.set_token_status(message)
 
     def _on_aot_toggled(self, checked: bool) -> None:
         app_settings.set_always_on_top(checked)
@@ -2754,6 +2846,10 @@ class SettingsPanel(QWidget):
         if hasattr(win, "refresh_usage_bar_colors"):
             win.refresh_usage_bar_colors()
 
+    def _on_auth_notify_toggled(self, checked: bool) -> None:
+        app_settings.set_auth_notify(checked)
+        self._sync_notify_subtoggles()   # this alert counts toward "any alert on"
+
     def _on_approaching_toggled(self, checked: bool) -> None:
         app_settings.set_approaching_enabled(checked)
         self._sync_notify_subtoggles()
@@ -2875,7 +2971,13 @@ class SettingsPanel(QWidget):
         self.approaching_box.setVisible(self.approaching_check.isChecked())
 
         # Shared "how" channels are relevant when any alert type is enabled.
-        any_on = self.notify_check.isChecked() or self.approaching_check.isChecked()
+        # The auth alert counts too: it delivers through these same channels,
+        # so leaving it out hid the "how" controls from anyone who had only
+        # that one on — while it went on firing toasts through settings they
+        # could no longer see.
+        any_on = (self.notify_check.isChecked()
+                  or self.auth_notify_check.isChecked()
+                  or self.approaching_check.isChecked())
         self.notify_how_box.setVisible(any_on)
 
         # Windows channel sub-box (sound + pop): only when shown + Windows on.
@@ -3344,6 +3446,7 @@ class Dashboard(QMainWindow):
         self._rate = RateGroupTracker()
         self._reset_notifier = ResetNotifier()
         self._approaching_notifier = ApproachingNotifier()
+        self._auth_notifier = AuthNotifier()
         # Idle poll back-off: track the last time a local session was active, and
         # whether the poll is currently slowed. Start "active" so a fresh launch
         # polls normally until the idle window elapses.
@@ -4399,6 +4502,9 @@ class Dashboard(QMainWindow):
         # for. Gated on the line being on screen -- opening the Connection tab
         # re-renders it anyway, so this only has to serve someone already
         # sitting on the page.
+        # Hand the poller's verdict to Settings before it re-renders, so the
+        # Connection tab can't promise an auto-refresh that has been stopped.
+        self.settings_panel.set_reauth_needed(s.status == STATUS_REAUTH_NEEDED)
         self._refresh_token_status_if_watched()
         if s.ok:
             self._observe_scoped(s)
@@ -4413,12 +4519,21 @@ class Dashboard(QMainWindow):
             overage_enabled=app_settings.get_overage_alert_enabled(),
             scoped=scoped_windows.shown(self._scoped.windows, self._scoped_shown),
         )
+        # Dispatched here, before the not-ok early return below, because the
+        # alert that matters most fires on exactly those samples.
+        auth_alert = self._auth_notifier.observe(
+            s, enabled=app_settings.get_auth_notify())
+        if auth_alert is not None:
+            self._dispatch_auth_alert(auth_alert)
         self._last_sample = s
         self.usage_history.record(s)   # ring + throttled disk log (skips errors)
         self._maybe_backoff_poll()     # adjust cadence to local session activity
         if not s.ok:
             self._apply_status_badge(s.status)
-            self._tray.setToolTip(f"Clawdmeter - {s.status}")
+            # Same wording as the badge, so the tray and the window can't
+            # disagree — and so the tooltip stops reading as a raw status slug.
+            failure = FAILURE_BADGES.get((s.status or "").lower())
+            self._tray.setToolTip(f"Clawdmeter - {failure[0] if failure else s.status}")
             self._last_tooltip = ""  # force a fresh stats tooltip on recovery
             return
 
@@ -4847,6 +4962,16 @@ class Dashboard(QMainWindow):
             self._remember_settled_size()
             self._size_save_timer.start()
 
+    def _dispatch_auth_alert(self, alert) -> None:
+        """Say once that usage can't be read, and once when it can again.
+
+        Goes through _deliver_alert like the reset and approaching alerts, so
+        it honours the channels the user already configured — including a
+        push-only setup, which is the one that reaches someone who is not
+        looking at the window. That is the whole point of this alert.
+        """
+        self._deliver_alert(alert.title, alert.body)
+
     def _apply_status_badge(self, status: str) -> None:
         """Show/hide the bottom-left rate-limit badge and reflow the window.
 
@@ -4855,9 +4980,22 @@ class Dashboard(QMainWindow):
         container is hidden when there's nothing to say so the WEEKLY bar
         sits tight against the bottom; minimum window height grows by the
         badge row's footprint when it appears.
+
+        A FAILED poll carries one of poller's STATUS_* values instead, and those
+        are matched exactly, ahead of the substring checks. They have to say
+        something: before this, a failed poll fell through to the else branch
+        and CLEARED the badge, so an expired token left the 5h / 7d bars frozen
+        on their last good values with no explanation anywhere in the window.
         """
         s = (status or "").lower()
-        if "reject" in s or "block" in s:
+        failure = FAILURE_BADGES.get(s)
+        if failure:
+            text, icon, level = failure
+            self.status_text.setText(text)
+            self.status_icon.setText(icon)
+            self.status_text.setProperty("level", level)
+            has_badge = True
+        elif "reject" in s or "block" in s:
             self.status_text.setText("Limit reached")
             self.status_icon.setText("❌")
             self.status_text.setProperty("level", "block")
