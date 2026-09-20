@@ -33,9 +33,20 @@ def _good():
     return poller.UsageSample(10, 60, 20, 600, "allowed", True, None, 0.0)
 
 
-@pytest.mark.parametrize("status", sorted(auth_notify.AUTH_FAILURE_STATUSES))
+# Written out by hand, NOT derived from AUTH_FAILURE_STATUSES. A test that
+# parametrises over the set it is checking cannot notice the set shrinking —
+# dropping a status just removes a case and the suite still passes green. A
+# mutation run caught exactly that.
+WATCHED_STATUSES = ["auth-expired", "reauth-needed", "no-token"]
+
+
+@pytest.mark.parametrize("status", WATCHED_STATUSES)
 def test_every_auth_failure_raises_the_alarm(status):
     assert AuthNotifier().observe(_bad(status)).kind == "lost"
+
+
+def test_the_watched_set_is_exactly_these_three():
+    assert auth_notify.AUTH_FAILURE_STATUSES == set(WATCHED_STATUSES)
 
 
 def test_it_fires_once_not_on_every_poll():
@@ -112,4 +123,11 @@ def test_turning_alerts_on_does_not_re_announce_an_old_outage():
 
 def test_every_auth_failure_status_has_its_own_wording():
     """A new one with no entry would fall back to a message that says nothing."""
-    assert auth_notify.AUTH_FAILURE_STATUSES <= set(auth_notify._LOST_BODIES)
+    assert set(WATCHED_STATUSES) <= set(auth_notify._LOST_BODIES)
+
+
+def test_the_statuses_match_the_pollers_own_names():
+    """Guards a rename on either side silently unwatching a failure."""
+    assert auth_notify.AUTH_FAILURE_STATUSES == {
+        poller.STATUS_AUTH_EXPIRED, poller.STATUS_REAUTH_NEEDED, poller.STATUS_NO_TOKEN,
+    }
