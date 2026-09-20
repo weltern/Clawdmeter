@@ -152,6 +152,36 @@ read as "all better now".
   again** button opened the browser and completed a Claude sign-in, after which
   the poller picked the new token up on its own.
 
+## Platforms
+
+CI runs the suite on `ubuntu-latest` and `windows-latest`, builds the Linux
+AppImage and tarball, and launch-smokes it under debian:12, ubuntu:22.04,
+ubuntu:24.04, fedora:40 and archlinux. **There is no macOS job**, so nothing
+here has been exercised on a Mac by anything but reasoning and fakes.
+
+**macOS cannot refresh its own token at all** — the credential lives in the
+login Keychain and writing the rotated one back is not implemented — so
+`needs_refresh`, the backoff ceilings and the blocked state are all inert
+there. That made every expiry render as "Token expired", promising a refresh
+that was never coming, which is the same defect as the Settings line on the one
+platform where it is true of *every* expiry. `auto_refresh_supported()` is the
+single condition behind both the "should I try" gate and the wording, so an
+expiry on macOS now reads "Sign in again" and the Sign in again button is live
+there (the only remedy that works). `CLAUDE_CREDENTIALS_PATH` still opts a Mac
+back onto the file path, and therefore back into refreshing.
+
+**The terminal handoff is per-platform and only the Windows path has ever run.**
+`xfce4-terminal -e` wants one quoted string, so passing it argv opened a
+terminal that never ran the command; it uses `-x` now. `x-terminal-emulator`
+moved from first choice to last resort because what it points at is unknown.
+Both failed the same way — `Popen` succeeded, so the user was told to finish in
+a window that had done nothing — which `_survived()` now catches by
+distinguishing a terminal still in the foreground, one that handed off and
+exited 0, and one that rejected its arguments and died.
+
+Still unproven and needing the VMs: whether a real `konsole`/`xfce4-terminal`
+accepts these flags, and whether `osascript` drives Terminal on the Mac box.
+
 ## Review
 
 A code review of the branch found seven issues, all fixed in `aa7635f`. Two
