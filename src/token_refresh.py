@@ -86,6 +86,21 @@ def _oauth_block(data: dict) -> dict | None:
     return None
 
 
+def auto_refresh_supported() -> bool:
+    """Can this install refresh its own token at all?
+
+    False on macOS, where the token lives in the login Keychain and writing the
+    rotated token back there is not implemented. EVERYTHING downstream of a
+    refresh is inert in that case — the lead window, the backoff ceilings, the
+    blocked state — so an expired token there must not be presented as one that
+    a refresh is about to fix. Only signing in again ever clears it.
+
+    One definition, called by the poller for both the "should I try" gate and
+    the "what do I call this failure" decision, so the two cannot drift.
+    """
+    return not _macos_keychain_active()
+
+
 def _macos_keychain_active() -> bool:
     """True when credentials come from the macOS Keychain, not a file.
 

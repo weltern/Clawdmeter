@@ -17,7 +17,7 @@ notices on its next cycle because it re-reads the expiry every time.
 
 from __future__ import annotations
 
-import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -81,28 +81,83 @@ def _spawn_windows(argv: list[str]) -> None:
     subprocess.Popen(argv, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
 
 
+SPAWN_GRACE_SECONDS = 0.4
+
+
+def _survived(proc: subprocess.Popen) -> bool:
+    """Did the spawn actually take?
+
+    Covers both launcher shapes without needing to know which is which:
+      * a terminal that stays in the foreground (xterm) is still running when
+        the grace period elapses — success;
+      * one that hands off to a server and exits (gnome-terminal, and osascript)
+        returns 0 — success;
+      * one that rejected how it was invoked exits non-zero almost at once —
+        failure, and worth trying the next candidate.
+
+    Without this, a terminal that opened but never ran the command still
+    reported "finish in the window that just opened", which is the worst
+    available outcome for a remedy of last resort.
+    """
+    try:
+        proc.wait(timeout=SPAWN_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        return True
+    return proc.returncode == 0
+
+
+def _applescript_string(argv: list[str]) -> str:
+    """argv as a shell command, escaped to survive an AppleScript literal.
+
+    Two layers: shlex for the shell inside Terminal, then backslash and quote
+    escaping for the AppleScript string wrapping it. A path containing a double
+    quote would otherwise end the literal early.
+    """
+    command = " ".join(shlex.quote(a) for a in argv)
+    return command.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _spawn_macos(argv: list[str]) -> None:
-    quoted = " ".join(f"'{a}'" for a in argv)
-    subprocess.Popen(
-        ["osascript", "-e", f'tell application "Terminal" to do script "{quoted}"']
-    )
+    script = f'tell application "Terminal" to do script "{_applescript_string(argv)}"'
+    proc = subprocess.Popen(["osascript", "-e", script])
+    if not _survived(proc):
+        raise OSError("osascript could not drive Terminal")
 
 
+# (binary, the flag that makes it take a command PLUS ITS ARGUMENTS as argv).
+#
+# The flag is the whole point, and it is not uniform:
+#   gnome-terminal --      everything after -- is the command
+#   konsole -e             takes the command and its arguments
+#   xfce4-terminal -x      --execute, "the remainder of the command line".
+#                          Its -e wants ONE quoted string instead, which is the
+#                          trap: passing argv to -e opens a terminal that never
+#                          runs the command.
+#   xterm -e               takes the command and its arguments
+#   x-terminal-emulator    the Debian alternative — behaviour depends on
+#                          whichever terminal it points at, so it is the last
+#                          resort rather than, as before, the first choice.
 LINUX_TERMINALS = (
-    ("x-terminal-emulator", "-e"),
     ("gnome-terminal", "--"),
     ("konsole", "-e"),
-    ("xfce4-terminal", "-e"),
+    ("xfce4-terminal", "-x"),
     ("xterm", "-e"),
+    ("x-terminal-emulator", "-e"),
 )
 
 
 def _spawn_linux(argv: list[str]) -> None:
+    tried = []
     for term, flag in LINUX_TERMINALS:
         exe = shutil.which(term)
-        if exe:
-            subprocess.Popen([exe, flag, *argv])
+        if not exe:
+            continue
+        tried.append(term)
+        if _survived(subprocess.Popen([exe, flag, *argv])):
             return
+    if tried:
+        raise OSError("no terminal would run the command (tried "
+                      + ", ".join(tried) + ")")
     raise FileNotFoundError("no terminal emulator found")
 
 

@@ -368,3 +368,172 @@ def test_other_failures_are_never_relabelled_as_auth(monkeypatch):
 
     for status in (poller.STATUS_OFFLINE, poller.STATUS_HTTP_ERROR):
         assert p._mark_reauth(_sample(status)).status == status
+
+
+# --------------------------------------------------------------------------
+# macOS cannot refresh at all, so every expiry there needs a sign-in
+# --------------------------------------------------------------------------
+
+def test_macos_cannot_auto_refresh():
+    """One definition, so the "should I try" gate and the wording can't drift."""
+    import macos_keychain
+    assert token_refresh.auto_refresh_supported() is (not macos_keychain.is_macos())
+
+
+def test_the_real_macos_condition_drives_it(monkeypatch):
+    """Forces is_macos rather than stubbing auto_refresh_supported.
+
+    Stubbing the helper proves the branches work; this proves the helper is
+    wired to the thing it claims to describe. The suite runs on Windows, so
+    without forcing it the macOS path is never entered at all.
+    """
+    import macos_keychain
+    monkeypatch.setattr(macos_keychain, "is_macos", lambda: True)
+    monkeypatch.delenv("CLAUDE_CREDENTIALS_PATH", raising=False)
+
+    assert token_refresh.auto_refresh_supported() is False
+
+    p = poller.UsagePoller()
+    assert p._mark_reauth(_sample(poller.STATUS_AUTH_EXPIRED)).status == \
+        poller.STATUS_REAUTH_NEEDED
+
+
+def test_an_explicit_credentials_file_opts_macos_back_in(monkeypatch):
+    """CLAUDE_CREDENTIALS_PATH means a real file, which CAN be written back."""
+    import macos_keychain
+    monkeypatch.setattr(macos_keychain, "is_macos", lambda: True)
+    monkeypatch.setenv("CLAUDE_CREDENTIALS_PATH", "/tmp/creds.json")
+
+    assert token_refresh.auto_refresh_supported() is True
+
+
+def test_an_expiry_on_macos_asks_for_a_sign_in(monkeypatch):
+    """Nothing there will ever refresh it, so "Token expired" is a false promise.
+
+    Same defect the Settings line was fixed for, on the one platform where it
+    is true of EVERY expiry rather than only a rejected one.
+    """
+    monkeypatch.setattr(token_refresh, "auto_refresh_supported", lambda: False)
+    p = poller.UsagePoller()
+
+    assert p._mark_reauth(_sample(poller.STATUS_AUTH_EXPIRED)).status == \
+        poller.STATUS_REAUTH_NEEDED
+
+
+def test_an_expiry_elsewhere_still_waits_for_the_refresh(monkeypatch):
+    """Control: the upgrade must key off the platform, not fire everywhere."""
+    monkeypatch.setattr(token_refresh, "auto_refresh_supported", lambda: True)
+    p = poller.UsagePoller()
+
+    assert p._mark_reauth(_sample(poller.STATUS_AUTH_EXPIRED)).status == \
+        poller.STATUS_AUTH_EXPIRED
+
+
+def test_the_poller_does_not_try_to_refresh_where_it_cannot(monkeypatch, tmp_path):
+    path = _creds(tmp_path, int((time.time() - 60) * 1000))   # expired: would refresh
+    monkeypatch.setattr(poller, "credentials_path", lambda: path)
+    monkeypatch.setattr(token_refresh, "auto_refresh_supported", lambda: False)
+
+    p = poller.UsagePoller()
+    calls = []
+    monkeypatch.setattr(p, "_do_refresh", lambda manual: calls.append(manual))
+    p._maybe_auto_refresh()
+
+    assert calls == []
+
+
+# --------------------------------------------------------------------------
+# The terminal handoff on the platforms that are not Windows
+# --------------------------------------------------------------------------
+
+class _FakeProc:
+    """Stands in for Popen: `code` None means it is still running."""
+
+    def __init__(self, code):
+        self.returncode = code
+
+    def wait(self, timeout=None):
+        import subprocess as _sp
+        if self.returncode is None:
+            raise _sp.TimeoutExpired("x", timeout)
+        return self.returncode
+
+
+@pytest.mark.parametrize("code, survived", [
+    (None, True),   # xterm: still in the foreground when the grace elapses
+    (0, True),      # gnome-terminal / osascript: hands off to a server, exits 0
+    (1, False),     # rejected the invocation and died
+    (2, False),
+])
+def test_a_terminal_that_dies_is_not_counted_as_opened(code, survived):
+    assert reauth._survived(_FakeProc(code)) is survived
+
+
+def test_xfce_uses_the_flag_that_takes_arguments(monkeypatch):
+    """-e wants ONE quoted string; passing argv to it opens a dead terminal."""
+    flags = dict(reauth.LINUX_TERMINALS)
+
+    assert flags["xfce4-terminal"] == "-x"
+
+
+def test_the_debian_alternative_is_the_last_resort(monkeypatch):
+    """It points at an unknown terminal, so it must not be tried first."""
+    order = [name for name, _ in reauth.LINUX_TERMINALS]
+
+    assert order[-1] == "x-terminal-emulator"
+    assert order[0] == "gnome-terminal"
+
+
+def test_linux_moves_on_when_a_terminal_refuses(monkeypatch):
+    spawned = []
+
+    def fake_popen(argv, **_kw):
+        spawned.append(argv[0])
+        return _FakeProc(1 if argv[0] != "xterm" else None)
+
+    monkeypatch.setattr(reauth.shutil, "which", lambda name: name)
+    monkeypatch.setattr(reauth.subprocess, "Popen", fake_popen)
+
+    reauth._spawn_linux(["/usr/bin/claude", "auth", "login"])
+
+    assert spawned[-1] == "xterm", f"stopped at the wrong terminal: {spawned}"
+    assert spawned[0] == "gnome-terminal"
+
+
+def test_linux_reports_when_no_terminal_would_run_it(monkeypatch):
+    """Every terminal present but every one refusing — the false-success case.
+
+    The platform is forced because the suite runs on Windows; without this the
+    test exercises _spawn_windows and proves nothing about Linux.
+    """
+    monkeypatch.setattr(reauth, "_is_windows", lambda: False)
+    monkeypatch.setattr(reauth, "_is_macos", lambda: False)
+    monkeypatch.setattr(reauth, "cli_path", lambda: "/usr/bin/claude")
+    monkeypatch.setattr(reauth.shutil, "which", lambda name: name)
+    monkeypatch.setattr(reauth.subprocess, "Popen", lambda argv, **_kw: _FakeProc(1))
+
+    started, message = reauth.start_login()
+
+    assert started is False
+    assert "claude auth login" in message
+
+
+def test_linux_reports_success_when_a_terminal_takes_it(monkeypatch):
+    """Control for the test above: the same path must be able to succeed."""
+    monkeypatch.setattr(reauth, "_is_windows", lambda: False)
+    monkeypatch.setattr(reauth, "_is_macos", lambda: False)
+    monkeypatch.setattr(reauth, "cli_path", lambda: "/usr/bin/claude")
+    monkeypatch.setattr(reauth.shutil, "which", lambda name: name)
+    monkeypatch.setattr(reauth.subprocess, "Popen", lambda argv, **_kw: _FakeProc(0))
+
+    started, _message = reauth.start_login()
+
+    assert started is True
+
+
+def test_applescript_escaping_survives_an_awkward_path():
+    """A double quote in the path would otherwise end the AppleScript literal."""
+    out = reauth._applescript_string(['/Users/a b/cl"aude', "auth", "login"])
+
+    assert '\\"' in out
+    assert out.count('"') == out.count('\\"'), "an unescaped quote would break out"

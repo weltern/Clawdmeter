@@ -401,7 +401,14 @@ class UsagePoller(QThread):
         Lives out here rather than inline in run() so it can be tested; the
         thread loop is not reachable from a test.
         """
-        if sample.status == STATUS_AUTH_EXPIRED and self._reauth_needed():
+        # Two ways there is no automatic recovery: the refresh token was
+        # refused, or this install cannot refresh at all. The second is macOS,
+        # where it is true of EVERY expiry — so the badge there said "Token
+        # expired", implying a refresh that was never coming. That is the same
+        # false promise the Settings line was fixed for, on the one platform
+        # where it is always wrong.
+        if sample.status == STATUS_AUTH_EXPIRED and (
+                self._reauth_needed() or not token_refresh.auto_refresh_supported()):
             sample.status = STATUS_REAUTH_NEEDED
         return sample
 
@@ -431,7 +438,7 @@ class UsagePoller(QThread):
         # next poll re-reads it. Skip here so we don't emit a refresh failure on
         # every cooldown while a token is expired. (An explicit file override on
         # Mac still takes the normal file path.)
-        if macos_keychain.is_macos() and not os.environ.get("CLAUDE_CREDENTIALS_PATH"):
+        if not token_refresh.auto_refresh_supported():
             return
         if self._reauth_needed():
             return
