@@ -100,6 +100,20 @@ def test_refresh_uses_current_endpoint_and_stored_scopes(monkeypatch, cred):
     assert not (path.parent / tr.LOCK_NAME).exists()
 
 
+def test_refresh_does_not_send_the_throttled_user_agent(monkeypatch, cred):
+    # The token endpoint 429s every request whose User-Agent is exactly
+    # "anthropic" (measured live), so sending it meant no refresh ever landed.
+    # Assert on the request actually sent, not the constant.
+    path, _ = cred
+    calls = _mock_http(monkeypatch, _ok_token)
+
+    tr.refresh(path)
+
+    ua = calls[0].headers.get("user-agent", "")
+    assert ua != "anthropic"
+    assert ua.startswith("Clawdmeter/")
+
+
 def test_falls_back_to_legacy_endpoint_on_404(monkeypatch, cred):
     path, _ = cred
 

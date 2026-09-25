@@ -50,6 +50,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+import app_settings
 import macos_keychain
 
 # Current Claude Code token endpoint first; the legacy console host is only a
@@ -61,7 +62,16 @@ OAUTH_TOKEN_URLS = (
 OAUTH_TOKEN_URL = OAUTH_TOKEN_URLS[0]
 # Public Claude Code OAuth client id (the same value Claude Code itself uses).
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-REFRESH_HEADERS = {"Content-Type": "application/json", "User-Agent": "anthropic"}
+# Identify as Clawdmeter. The endpoint answers the exact string "anthropic"
+# with HTTP 429 on every request, whatever the token, while any other
+# User-Agent reaches the real token check (measured 2026-09-24: "anthropic"
+# 429, "Anthropic" / "Clawdmeter/3.1.0" / httpx's default 400 on a fake
+# token). So that value never refreshed anything. Same string the update
+# check sends.
+REFRESH_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": f"Clawdmeter/{app_settings.APP_VERSION}",
+}
 
 EXPIRY_SKEW_SECONDS = 120  # treat the token as expired this many seconds early
 # How far AHEAD of expiry the poller refreshes. Deliberately much larger than
