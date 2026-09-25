@@ -76,6 +76,9 @@ class UsageSample:
     extra_usage_used_usd: float = 0.0       # real extra-usage spend, in dollars
     extra_usage_limit_usd: float | None = None  # monthly cap in $, None = uncapped
     model_windows: dict = field(default_factory=dict)  # {model display name: percent}
+    # True when the probe was rejected with 401 -- the token is expired or was
+    # rotated out from under us, whatever its stored expiresAt claims.
+    auth_failed: bool = False
 
 
 def credentials_path() -> Path:
@@ -250,6 +253,9 @@ def _poll_once(token: str) -> UsageSample:
                     setattr(sample, k, v)
             except (httpx.HTTPError, ValueError, TypeError):
                 pass
+    except httpx.HTTPStatusError as exc:
+        return UsageSample(0, 0, 0, 0, "error", False, str(exc), now,
+                           auth_failed=exc.response.status_code == 401)
     except httpx.HTTPError as exc:
         return UsageSample(0, 0, 0, 0, "error", False, str(exc), now)
     # Sum the local transcripts' input+output over the 5h/7d windows — only when
@@ -311,13 +317,19 @@ class UsagePoller(QThread):
         """Ask the poll thread to refresh the token ASAP (bypasses cooldown)."""
         self._manual_refresh = True
 
-    def _do_refresh(self, manual: bool) -> None:
+    def _do_refresh(self, manual: bool, force: bool = False,
+                    seen_access: str | None = None) -> None:
         self._last_refresh_attempt = time.time()
-        result = token_refresh.refresh(credentials_path())
+        result = token_refresh.refresh(credentials_path(), force=force,
+                                       seen_access=seen_access)
         if result.ok:
             self._cooldown = self.REFRESH_COOLDOWN_MIN
         elif result.http_status == 429 and not manual:
             self._cooldown = min(self._cooldown * 2, self.REFRESH_COOLDOWN_MAX)
+        if result.busy and not manual:
+            # Claude Code holds the lock and is refreshing the same file; its
+            # result shows up on a later read. Not an error worth surfacing.
+            return
         self.refresh_status.emit(result)
 
     def _maybe_auto_refresh(self) -> None:
@@ -336,6 +348,25 @@ class UsagePoller(QThread):
             return
         self._do_refresh(manual=False)
 
+    def _recover_from_401(self, used_token: str) -> UsageSample | None:
+        """The API rejected a token its expiresAt called valid. Re-poll with a
+        newer token if one is on disk, else force a refresh (subject to the same
+        cooldown as auto-refresh) and re-poll with its result. None = no luck;
+        the caller keeps the failed sample."""
+        fresh = read_token()
+        if fresh and fresh != used_token:
+            return _poll_once(fresh)
+        if (not self._auto_refresh
+                or (macos_keychain.is_macos()
+                    and not os.environ.get("CLAUDE_CREDENTIALS_PATH"))
+                or time.time() - self._last_refresh_attempt < self._cooldown):
+            return None
+        self._do_refresh(manual=False, force=True, seen_access=used_token)
+        fresh = read_token()
+        if fresh and fresh != used_token:
+            return _poll_once(fresh)
+        return None
+
     def run(self) -> None:  # QThread entry
         while not self._stop:
             self._wake = False  # cleared each cycle; a wake during this poll re-sets it
@@ -351,7 +382,10 @@ class UsagePoller(QThread):
                     f"No token in {token_source_description()}", time.time(),
                 ))
             else:
-                self.sample.emit(_poll_once(token))
+                sample = _poll_once(token)
+                if sample.auth_failed:
+                    sample = self._recover_from_401(token) or sample
+                self.sample.emit(sample)
 
             for _ in range(self._interval):
                 if self._stop:

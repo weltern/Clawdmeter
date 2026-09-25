@@ -259,9 +259,15 @@ six tabs that each scroll on their own. Here's every setting, grouped by tab.
   a non-default `.credentials.json`.
 - **Token** — Claude's OAuth access token expires roughly every 8 hours, which
   would otherwise blank the dashboard. With **Auto-refresh when expired** on (the
-  default), the app mints a fresh token automatically so it stays live. The
-  **Refresh token now** button is a manual override, enabled only when the token
-  is actually expired.
+  default), the app mints a fresh token a few minutes before it expires, so it
+  stays live. The **Refresh token now** button is a manual override, enabled only
+  when the token is expired or about to be. This matters most if you use Claude
+  Code through the **Claude desktop app**: the desktop app keeps its own login,
+  so unlike the `claude` CLI it never renews `~/.claude/.credentials.json` and
+  Clawdmeter has to do it. Clawdmeter refreshes the same way the CLI does, under
+  the CLI's own refresh lock, so the two never use up each other's refresh token.
+  If the refresh token itself is rejected, the status line tells you to sign in
+  again (`claude`, then `/login`) and Clawdmeter stops retrying.
 - **Usage polling** — how often the app checks your usage. Each check is a tiny
   billed API request, so the interval is adjustable from **10 to 600 seconds**
   (60 by default): lower is fresher but makes more requests; higher is gentler on
