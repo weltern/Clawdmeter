@@ -48,7 +48,8 @@ _LOST_BODIES = {
 }
 
 LOST_TITLE = "Clawdmeter can't read your usage"
-RESTORED_TITLE = "Clawdmeter is reading your usage again"
+REAUTH_TITLE = "Clawdmeter needs you to sign in"
+RESTORED_TITLE ="Clawdmeter is reading your usage again"
 RESTORED_BODY = "The connection recovered — the 5h and 7d windows are live again."
 
 
@@ -63,8 +64,9 @@ class AuthAlert:
 class AuthNotifier:
     """Edge-triggered auth-health detector.
 
-    Feed every UsageSample to observe(); it returns an AuthAlert on the two
-    transitions that matter and None the rest of the time.
+    Feed every UsageSample to observe(); it returns an AuthAlert on the
+    transitions that matter — going blind, an expiry becoming "sign in again",
+    and seeing again — and None the rest of the time.
 
     Deliberately NOT primed on first sight, unlike ApproachingNotifier: if the
     app starts up already unable to authenticate, that is exactly the moment
@@ -74,6 +76,11 @@ class AuthNotifier:
 
     def __init__(self) -> None:
         self._blind = False
+        # Whether the user has already been told that only signing in helps.
+        # The first alert for an expiry says Clawdmeter is refreshing; if that
+        # refresh is then rejected, staying silent would leave that promise
+        # standing while nothing is coming — so that one change alerts again.
+        self._told_reauth = False
 
     def observe(self, s: UsageSample, *, enabled: bool = True) -> AuthAlert | None:
         status = getattr(s, "status", "") or ""
@@ -82,6 +89,7 @@ class AuthNotifier:
 
         if failing and not self._blind:
             self._blind = True
+            self._told_reauth = status == "reauth-needed"
             # State advances even when alerts are off, so turning them on later
             # doesn't immediately fire about a condition that began long ago.
             if not enabled:
@@ -89,10 +97,19 @@ class AuthNotifier:
             return AuthAlert("lost", LOST_TITLE,
                              _LOST_BODIES.get(status, "Usage can't be read."), status)
 
+        # Already blind, and the failure has just become one only the user can
+        # fix. Once per outage: flipping back and forth must not repeat it.
+        if failing and status == "reauth-needed" and not self._told_reauth:
+            self._told_reauth = True
+            if not enabled:
+                return None
+            return AuthAlert("lost", REAUTH_TITLE, _LOST_BODIES[status], status)
+
         # Recovery is a real OK sample, never merely "a different failure".
         # An offline sample after an expiry must not read as "all better now".
         if ok and self._blind:
             self._blind = False
+            self._told_reauth = False
             if not enabled:
                 return None
             return AuthAlert("restored", RESTORED_TITLE, RESTORED_BODY, "")

@@ -104,6 +104,46 @@ def test_a_plain_expiry_does_not_tell_you_to_sign_in():
     assert "sign in again" not in alert.body.lower()
 
 
+def test_an_expiry_that_turns_into_sign_in_again_says_so():
+    """The first alert promised a refresh. When that refresh is rejected the
+    promise is dead, and staying quiet would leave it standing."""
+    n = AuthNotifier()
+    seq = [_bad(poller.STATUS_AUTH_EXPIRED), _bad(poller.STATUS_AUTH_EXPIRED),
+           _bad(poller.STATUS_REAUTH_NEEDED), _bad(poller.STATUS_REAUTH_NEEDED),
+           _good()]
+
+    alerts = [a for a in (n.observe(s) for s in seq) if a is not None]
+
+    assert [a.kind for a in alerts] == ["lost", "lost", "restored"]
+    assert "sign in again" in alerts[1].body.lower()
+    assert alerts[1].title == auth_notify.REAUTH_TITLE
+
+
+def test_sign_in_again_is_said_once_per_outage():
+    """Flapping between the two statuses must not repeat it, and an outage that
+    STARTED as sign-in-again has nothing further to escalate to."""
+    n = AuthNotifier()
+    n.observe(_bad(poller.STATUS_AUTH_EXPIRED))
+    n.observe(_bad(poller.STATUS_REAUTH_NEEDED))
+    later = [n.observe(_bad(s)) for s in (poller.STATUS_AUTH_EXPIRED,
+                                           poller.STATUS_REAUTH_NEEDED)]
+    assert later == [None, None]
+
+    m = AuthNotifier()
+    m.observe(_bad(poller.STATUS_REAUTH_NEEDED))
+    assert m.observe(_bad(poller.STATUS_REAUTH_NEEDED)) is None
+
+
+def test_the_escalation_re_arms_after_a_recovery():
+    n = AuthNotifier()
+    for s in (poller.STATUS_AUTH_EXPIRED, poller.STATUS_REAUTH_NEEDED):
+        n.observe(_bad(s))
+    n.observe(_good())
+    n.observe(_bad(poller.STATUS_AUTH_EXPIRED))
+
+    assert n.observe(_bad(poller.STATUS_REAUTH_NEEDED)) is not None
+
+
 def test_starting_up_already_broken_still_alerts():
     """Deliberately unprimed: launching after the token died is the worst case."""
     assert AuthNotifier().observe(_bad(poller.STATUS_AUTH_EXPIRED)) is not None
