@@ -2195,7 +2195,14 @@ class SettingsPanel(QWidget):
             self._on_weekly_pct_changed)
         appr_box.addLayout(sess_row)
         appr_box.addLayout(week_row)
-        self.overage_check = QCheckBox("Also alert when I cross 100% into overage")
+        # One switch for every window's 100% alert. The label used to name only
+        # overage, which hid that it also gates the additional limits' own
+        # "reached 100%" alert (see approaching_notify.LimitEvent.kind).
+        self.overage_check = QCheckBox("Also alert when a limit passes 100%")
+        self.overage_check.setToolTip(
+            "Session and weekly: you're into paid overage.\n"
+            "Additional limits: that limit is used up."
+        )
         self.overage_check.setChecked(app_settings.get_overage_alert_enabled())
         self.overage_check.toggled.connect(self._on_overage_alert_toggled)
         appr_box.addWidget(self.overage_check)

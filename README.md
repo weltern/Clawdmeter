@@ -306,10 +306,11 @@ channels are shared across every alert.
   **% threshold for the 5h session and the 7d week** (50–99%; defaults 90% and
   80%, since the weekly window is the scarce one you can't recover quickly). Each
   warning fires **once** when you cross its threshold and re-arms after that
-  window resets, so it never nags every poll. **Also alert when I cross 100% into
-  overage** adds a ping the moment either window tips onto paid usage credits.
+  window resets, so it never nags every poll. **Also alert when a limit passes
+  100%** adds a ping the moment either window tips onto paid usage credits.
   Any additional limit you've ticked in **Display** is watched too — a weekly
-  one at the 7d threshold — with its own "reached 100% of its limit" ping.
+  one at the 7d threshold — and, with that same box on, gets its own "reached
+  100% of its limit" ping.
   Off by default — flip it on when you want the heads-up.
 
   You choose **where** alerts reach you — pick either channel, or both. **Show a
