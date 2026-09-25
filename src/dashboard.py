@@ -71,6 +71,7 @@ from PySide6.QtWidgets import (
 import app_settings
 import macos_keychain
 import poll_cadence
+import reauth
 import run_at_startup
 import start_menu
 import token_refresh
@@ -79,6 +80,8 @@ from mood import GROUP_ANIMS, GROUP_NAMES, RateGroupTracker
 from poller import (
     UsagePoller, UsageSample, credentials_path, DEFAULT_CREDENTIALS_PATH,
     token_source_description,
+    STATUS_AUTH_EXPIRED, STATUS_HTTP_ERROR, STATUS_NO_TOKEN, STATUS_OFFLINE,
+    STATUS_REAUTH_NEEDED,
 )
 import macos_window
 import remote_notify
@@ -89,14 +92,17 @@ import theme
 from color_picker import ColorPicker
 from usage_history import UsageHistory
 from approaching_notify import ApproachingNotifier
+from auth_notify import AuthNotifier
 from reset_notify import ResetDecision, ResetNotifier
 import update_check
 from update_check import UpdateChecker
 from pricing_refresh import PricingRefresher
 import session_shelf
 from session_shelf import (
-    CompactView, SessionShelf, UsageBar, apply_overage_bar,
+    SCOPED_OVER_TAG, CompactView, ScopedRows, SessionShelf, UsageBar,
+    apply_overage_bar, scoped_reset_text,
 )
+import scoped_windows
 from sprite_player import SpritePlayer, assets_root
 from transcript import (
     ACTIVITY_ANIMS,
@@ -112,6 +118,22 @@ from transcript import (
 )
 from uiutil import (ThemedPopup, bar_warn_thresholds, is_wayland, make_popup,
                     format_minutes as _format_minutes, heat as _heat)
+
+
+# What the bottom-left badge says when a poll FAILS: {status: (text, icon, level)}.
+# `level` drives the QSS colour and only "warn" (amber) and "block" (red) are
+# styled, so nothing here may invent a third one.
+#
+# The split matters more than the wording: "Token expired" points at a fix the
+# user can carry out, "Offline" says to wait. Collapsing both into one message
+# is what this table exists to prevent.
+FAILURE_BADGES = {
+    STATUS_AUTH_EXPIRED: ("Token expired", "🔑", "block"),
+    STATUS_REAUTH_NEEDED: ("Sign in again", "🔑", "block"),
+    STATUS_NO_TOKEN: ("No token found", "🔑", "block"),
+    STATUS_HTTP_ERROR: ("API error", "⚠️", "warn"),
+    STATUS_OFFLINE: ("Offline", "⚠️", "warn"),
+}
 
 
 # Stable tile id used in single-mascot mode (Settings: show multiple sessions
@@ -157,6 +179,9 @@ def _should_persist_size(fit_armed: bool, fitting: bool) -> bool:
 
 # Valid view modes, largest -> smallest.
 VIEW_ORDER = ("full", "compact", "mini")
+
+# The empty-state (no sessions) mascot's size when the window has room for it.
+HERO_MASCOT_MAX = 240
 
 
 # The frameless windows draw a 1px #root border to define their edge -- good on
@@ -440,6 +465,11 @@ class MiniWidget(QWidget):
         stack.setSpacing(3)
         self.session_pct, self.session_reset, self.session_bar = self._row(stack, "miniPct")
         self.weekly_pct, self.weekly_reset, self.weekly_bar = self._row(stack, "miniPctSub")
+        # Scoped windows the user ticked, each a dim row like WEEKLY's with the
+        # limit's name leading its reset text (the mini has no titles).
+        self.scoped_rows = ScopedRows(self._make_scoped_row, self._render_scoped_row,
+                                      spacing=3)
+        stack.addWidget(self.scoped_rows)
         row.addLayout(stack, 1)
 
         # ThemedPopup, not QMenu — a menu's panel cannot be painted opaque on
@@ -452,7 +482,28 @@ class MiniWidget(QWidget):
         self.customContextMenuRequested.connect(
             lambda pos: self._menu.popup_at(self.mapToGlobal(pos))
         )
-        self.setToolTip("Session (top) · Weekly (bottom)\nDouble-click to expand · drag to move")
+        self._set_rows_tooltip([])
+
+    _TOOLTIP_HINT = "Double-click to expand · drag to move"
+
+    def _set_rows_tooltip(self, labels: list[str]) -> None:
+        if not labels:
+            rows = "Session (top) · Weekly (bottom)"
+        else:
+            rows = "Top to bottom: Session · Weekly · " + " · ".join(labels)
+        self.setToolTip(f"{rows}\n{self._TOOLTIP_HINT}")
+
+    def _make_scoped_row(self):
+        row = QWidget()
+        col = QVBoxLayout(row)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(3)
+        return row, self._row(col, "miniPctSub")
+
+    def _render_scoped_row(self, parts, window, minutes: int, warn_at: int) -> None:
+        pct, reset, bar = parts
+        self._set_bar(pct, bar, window.pct, warn_at)
+        reset.setText(f"{window.name} · {scoped_reset_text(window, minutes)}")
 
     def _row(self, parent_layout: QVBoxLayout, pct_object: str):
         line = QHBoxLayout()
@@ -477,11 +528,12 @@ class MiniWidget(QWidget):
         return pct, reset, bar
 
     def update_usage(self, session_pct: int, weekly_pct: int,
-                     session_reset_minutes: int, weekly_reset_minutes: int) -> None:
+                     session_reset_minutes: int, weekly_reset_minutes: int,
+                     scoped=()) -> None:
         s_warn, w_warn = bar_warn_thresholds()
         self._set_bar(self.session_pct, self.session_bar, session_pct, s_warn)
         self._set_bar(self.weekly_pct, self.weekly_bar, weekly_pct, w_warn)
-        self.set_resets(session_reset_minutes, weekly_reset_minutes)
+        self.set_resets(session_reset_minutes, weekly_reset_minutes, scoped)
 
     @staticmethod
     def _set_bar(pct_label, bar, pct: int, warn_at: int) -> None:
@@ -495,10 +547,18 @@ class MiniWidget(QWidget):
             bar.set_values(pct, 0, _heat(pct, warn_at))
         pct_label.setText(f"{pct}%")
 
-    def set_resets(self, session_reset_minutes: int, weekly_reset_minutes: int) -> None:
-        """Reset labels in the same relative form as the main window."""
+    def set_resets(self, session_reset_minutes: int, weekly_reset_minutes: int,
+                   scoped=()) -> None:
+        """Reset labels in the same relative form as the main window.
+        ``scoped``: ``(window, reset_minutes, warn_at)`` per scoped window shown —
+        pass it on every call, since an empty value removes those rows."""
         self.session_reset.setText(f"resets in {_format_minutes(session_reset_minutes)}")
         self.weekly_reset.setText(f"resets in {_format_minutes(weekly_reset_minutes)}")
+        if self.scoped_rows.set_windows(scoped):
+            self._set_rows_tooltip([w.label for w, _m, _warn in scoped])
+        # The width follows the reset texts, which change every minute, so the
+        # rows' own layouts must be current before lock_size measures.
+        self.scoped_rows.settle()
         self.lock_size()
 
     # Qt's QWIDGETSIZE_MAX — the "no constraint" sentinel for max size.
@@ -1687,7 +1747,7 @@ class SettingsPanel(QWidget):
                  on_refresh_token=None, on_auto_refresh_changed=None,
                  on_poll_interval_changed=None, on_sessions_view_changed=None,
                  on_token_view_changed=None, on_check_updates=None,
-                 on_idle_backoff_changed=None) -> None:
+                 on_idle_backoff_changed=None, on_scoped_view_changed=None) -> None:
         super().__init__(parent)
         self.setObjectName("settingsPanel")
         self.setAttribute(Qt.WA_StyledBackground, True)
@@ -1695,11 +1755,16 @@ class SettingsPanel(QWidget):
         self._on_auto_hide_changed = on_auto_hide_changed
         self._on_refresh_token = on_refresh_token
         self._on_auto_refresh_changed = on_auto_refresh_changed
+        # Set by the Dashboard from the poll thread's verdict. The poller owns
+        # whether automatic refresh has been switched off; this panel must not
+        # promise one while it is.
+        self._reauth_needed = False
         self._on_poll_interval_changed = on_poll_interval_changed
         self._on_sessions_view_changed = on_sessions_view_changed
         self._on_token_view_changed = on_token_view_changed
         self._on_check_updates = on_check_updates
         self._on_idle_backoff_changed = on_idle_backoff_changed
+        self._on_scoped_view_changed = on_scoped_view_changed
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1842,6 +1907,12 @@ class SettingsPanel(QWidget):
         self.refresh_token_btn = QPushButton("Refresh token now")
         self.refresh_token_btn.clicked.connect(self._on_refresh_token_clicked)
         layout.addWidget(self.refresh_token_btn)
+        # The escape hatch for when refreshing cannot work at all: a dead
+        # refresh token, or a macOS Keychain that Clawdmeter cannot write to.
+        # Always present so it is findable before it is needed.
+        self.reauth_btn = QPushButton("Sign in again")
+        self.reauth_btn.clicked.connect(self._on_reauth_clicked)
+        layout.addWidget(self.reauth_btn)
         self.refresh_token_status()
 
         layout = gen_layout
@@ -1966,6 +2037,28 @@ class SettingsPanel(QWidget):
         self.token_usage_check.toggled.connect(self._on_token_usage_toggled)
         layout.addWidget(self.token_usage_check)
 
+        layout.addSpacing(10)
+        layout.addWidget(QLabel("ADDITIONAL LIMITS", objectName="sectionLabel"))
+        scoped_hint = QLabel(
+            "Some plans also have limits beyond the 5-hour and weekly windows, "
+            "like a weekly limit on one model. Tick one to add its bar to the "
+            "dashboard, compact and mini views. Approaching-limit alerts, when "
+            "on, cover it too.",
+            objectName="sectionHint",
+        )
+        scoped_hint.setWordWrap(True)
+        layout.addWidget(scoped_hint)
+        # One checkbox per window ever reported, rebuilt when that list changes
+        # (see set_scoped_windows).
+        self._scoped_box = QWidget()
+        self._scoped_col = QVBoxLayout(self._scoped_box)
+        self._scoped_col.setContentsMargins(0, 0, 0, 0)
+        self._scoped_col.setSpacing(6)
+        layout.addWidget(self._scoped_box)
+        self._scoped_checks: dict[str, QCheckBox] = {}
+        self._scoped_state = None
+        self.set_scoped_windows(app_settings.get_scoped_seen(), None)
+
         layout = conn_layout
         layout.addSpacing(10)
         layout.addWidget(QLabel("USAGE POLLING", objectName="sectionLabel"))
@@ -2073,6 +2166,16 @@ class SettingsPanel(QWidget):
         self.notify_check.setChecked(app_settings.get_reset_notify())
         self.notify_check.toggled.connect(self._on_notify_toggled)
         layout.addWidget(self.notify_check)
+
+        self.auth_notify_check = QCheckBox("When usage can't be read (sign-in problem)")
+        self.auth_notify_check.setChecked(app_settings.get_auth_notify())
+        self.auth_notify_check.toggled.connect(self._on_auth_notify_toggled)
+        self.auth_notify_check.setToolTip(
+            "The session shelf keeps working without a token, so a sign-in "
+            "problem is easy to miss. Fires once when it happens and once when "
+            "it recovers."
+        )
+        layout.addWidget(self.auth_notify_check)
 
         # Approaching-limit master + its threshold sub-box.
         self.approaching_check = QCheckBox("When approaching a limit")
@@ -2394,10 +2497,19 @@ class SettingsPanel(QWidget):
             self.auto_refresh_check.blockSignals(True)
             self.auto_refresh_check.setChecked(False)
             self.auto_refresh_check.blockSignals(False)
+            # Signing in again is the ONE thing that does work on macOS, and it
+            # is exactly what the note above tells the user to do, so this stays
+            # live beside two greyed-out controls rather than joining them.
+            self._set_reauth_enabled(True, "")
         else:
             self.auto_refresh_check.setEnabled(True)
             self.auto_refresh_check.setToolTip("")
-            needs_refresh = token_refresh.is_expired(path)
+            # blocking=False for the same reason as the `exp` read above: this
+            # runs on the UI thread during SettingsPanel construction, and a
+            # blocking macOS Keychain read here is what once hung the app
+            # before it drew anything. The comment above used to sit eleven
+            # lines over a call that blocked anyway.
+            needs_refresh = token_refresh.is_expired(path, blocking=False)
             self.refresh_token_btn.setEnabled(needs_refresh)
             if needs_refresh:
                 self.refresh_token_btn.setText("Refresh token now")
@@ -2408,6 +2520,13 @@ class SettingsPanel(QWidget):
                     "Disabled because your token is still valid — it refreshes "
                     "automatically when it expires."
                 )
+            # Same gate as the refresh button: offered whenever the token is in
+            # trouble, disabled WITH A REASON rather than hidden the rest of the
+            # time, so it can be found before it is needed.
+            self._set_reauth_enabled(needs_refresh, "" if needs_refresh else (
+                "Disabled because your token is still valid. Signing in again "
+                "replaces your Claude Code credentials."
+            ))
         if preserve_message:
             return          # controls are up to date; the message stays put
         # A full re-render replaces whatever set_token_status() put there, so
@@ -2444,7 +2563,14 @@ class SettingsPanel(QWidget):
                 self.token_status.setText(
                     f"Valid for ~{h}h {m}m — read from the login Keychain.")
             return
-        if secs <= 0:
+        if secs <= 0 and self._reauth_needed:
+            # Auto-refresh has been switched off by a rejected refresh token, so
+            # "wait for auto-refresh" would send the user waiting for something
+            # that is never coming — the same mistake the macOS branch above
+            # exists to avoid. Name the one remedy that can still work.
+            self.token_status.setText(
+                "Token expired and can't be refreshed — use Sign in again above.")
+        elif secs <= 0:
             self.token_status.setText("Token expired — refresh now, or wait for auto-refresh.")
         elif needs_refresh:
             self.token_status.setText("Token expiring — refresh now, or wait for auto-refresh.")
@@ -2548,6 +2674,35 @@ class SettingsPanel(QWidget):
             self.set_token_status("Refreshing…")
             self._on_refresh_token()
 
+    def set_reauth_needed(self, needed: bool) -> None:
+        """Tell the panel that automatic refresh has been switched off.
+
+        Re-renders only on a CHANGE: this is fed from every poll, and an
+        unconditional re-render would wipe the held failure message that
+        set_token_status() puts up, once per poll, before it could be read.
+        """
+        needed = bool(needed)
+        if needed == self._reauth_needed:
+            return
+        self._reauth_needed = needed
+        if self.connection_tab_is_current():
+            self.refresh_token_status()
+
+    def _set_reauth_enabled(self, enabled: bool, tooltip: str) -> None:
+        """Enable/disable the sign-in button, saying why when it is off.
+
+        A missing CLI does NOT disable it: clicking then reports the command to
+        run, which is more use than a dead control with no explanation.
+        """
+        self.reauth_btn.setEnabled(enabled)
+        self.reauth_btn.setToolTip(tooltip)
+
+    def _on_reauth_clicked(self) -> None:
+        # start_login never raises; a False comes back as a message that always
+        # ends in the command to run, so this cannot dead-end.
+        _started, message = reauth.start_login()
+        self.set_token_status(message)
+
     def _on_aot_toggled(self, checked: bool) -> None:
         app_settings.set_always_on_top(checked)
         if self._on_aot_changed:
@@ -2583,6 +2738,50 @@ class SettingsPanel(QWidget):
         app_settings.set_show_token_usage(checked)
         if self._on_token_view_changed:
             self._on_token_view_changed()
+
+    _SCOPED_EMPTY_TEXT = "None reported for your account yet."
+    _SCOPED_ABSENT_SUFFIX = " — not reported right now"
+
+    def set_scoped_windows(self, seen, current_keys) -> None:
+        """Rebuild the ADDITIONAL LIMITS checkboxes: one per remembered
+        ``(key, label)``, ticked from the saved choice. ``current_keys`` — the
+        keys in the latest usage response, or None before any — marks a
+        remembered window that isn't being reported, so ticking it and seeing
+        no bar isn't a mystery. Called on every poll; a no-op unless something
+        it shows changed."""
+        seen = list(seen)
+        current = None if current_keys is None else frozenset(current_keys)
+        if (seen, current) == self._scoped_state:
+            return
+        self._scoped_state = (seen, current)
+        while self._scoped_col.count():
+            item = self._scoped_col.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self._scoped_checks = {}
+        if not seen:
+            empty = QLabel(self._SCOPED_EMPTY_TEXT, objectName="sectionHint")
+            empty.setWordWrap(True)
+            self._scoped_col.addWidget(empty)
+            return
+        shown = set(app_settings.get_scoped_shown())
+        for key, label in seen:
+            text = label
+            if current is not None and key not in current:
+                text += self._SCOPED_ABSENT_SUFFIX
+            check = QCheckBox(text)
+            check.setChecked(key in shown)
+            check.toggled.connect(self._on_scoped_toggled)
+            self._scoped_col.addWidget(check)
+            self._scoped_checks[key] = check
+
+    def _on_scoped_toggled(self, _checked: bool) -> None:
+        # Save every box's state (not a toggle of one key) so the stored list
+        # always matches what's on screen, in Settings order.
+        app_settings.set_scoped_shown(
+            [k for k, c in self._scoped_checks.items() if c.isChecked()])
+        if self._on_scoped_view_changed:
+            self._on_scoped_view_changed()
 
     def _make_threshold_slider(self, label: str, value: int, on_change):
         """A row for an approaching-limit % threshold: window label, a slider over
@@ -2646,6 +2845,10 @@ class SettingsPanel(QWidget):
         win = self.window()
         if hasattr(win, "refresh_usage_bar_colors"):
             win.refresh_usage_bar_colors()
+
+    def _on_auth_notify_toggled(self, checked: bool) -> None:
+        app_settings.set_auth_notify(checked)
+        self._sync_notify_subtoggles()   # this alert counts toward "any alert on"
 
     def _on_approaching_toggled(self, checked: bool) -> None:
         app_settings.set_approaching_enabled(checked)
@@ -2768,7 +2971,13 @@ class SettingsPanel(QWidget):
         self.approaching_box.setVisible(self.approaching_check.isChecked())
 
         # Shared "how" channels are relevant when any alert type is enabled.
-        any_on = self.notify_check.isChecked() or self.approaching_check.isChecked()
+        # The auth alert counts too: it delivers through these same channels,
+        # so leaving it out hid the "how" controls from anyone who had only
+        # that one on — while it went on firing toasts through settings they
+        # could no longer see.
+        any_on = (self.notify_check.isChecked()
+                  or self.auth_notify_check.isChecked()
+                  or self.approaching_check.isChecked())
         self.notify_how_box.setVisible(any_on)
 
         # Windows channel sub-box (sound + pop): only when shown + Windows on.
@@ -3074,7 +3283,14 @@ class Dashboard(QMainWindow):
         # Hero mascot for the EMPTY (0-session) state — the single rate-driven
         # mascot that's been the app's face from day one. Wrapped in its own
         # widget so the whole block can hide as a unit when the shelf is shown.
-        self.sprite = SpritePlayer(size=240)
+        # Scales to the height it is given, capped at its long-standing 240px,
+        # so a window with room looks as it always has. When there isn't room —
+        # additional-limit rows taking height — the mascot shrinks instead of
+        # its minimum size forcing the window taller (measured: 572 -> 627px
+        # for one row), the same way the session shelf's mascots already fit.
+        self.sprite = SpritePlayer(size=HERO_MASCOT_MAX, scale_to_fit=True,
+                                   min_size=SessionShelf.MIN_MASCOT)
+        self.sprite.setMaximumSize(HERO_MASCOT_MAX, HERO_MASCOT_MAX)
         self.hero = QWidget()
         sprite_row = QHBoxLayout(self.hero)
         sprite_row.setContentsMargins(0, 0, 0, 0)
@@ -3105,6 +3321,19 @@ class Dashboard(QMainWindow):
         layout.addLayout(group_session)
         self.weekly_row, self.weekly_title, self.weekly_pct, self.weekly_bar, self.weekly_reset = self._build_row("WEEKLY (7d)")
         layout.addLayout(self.weekly_row)
+
+        # Scoped windows ticked in Settings (e.g. WEEKLY · FABLE): full-size
+        # rows at the main layout's 12px rhythm. Hidden, it takes no space. The
+        # window is not resized for them (see _apply_session_view) — they take
+        # their height from the mascot area above.
+        self.scoped_rows = ScopedRows(self._make_scoped_row, self._render_scoped_row,
+                                      spacing=12)
+        layout.addWidget(self.scoped_rows)
+        # Scoped-window state: last-known list (kept across a failed usage
+        # request) and the keys ticked in Settings, cached off the registry
+        # because the 1s countdown reads it.
+        self._scoped = scoped_windows.ScopedWindowTracker()
+        self._scoped_shown = app_settings.get_scoped_shown()
 
         # Status badge: only visible when nearing/at the rate limit. When
         # hidden it takes zero vertical space so the WEEKLY bar hugs the
@@ -3151,6 +3380,7 @@ class Dashboard(QMainWindow):
             on_token_view_changed=self._apply_token_view,
             on_check_updates=self._check_for_updates_now,
             on_idle_backoff_changed=self._apply_poll_cadence,
+            on_scoped_view_changed=self._apply_scoped_view,
         )
         self._pages.addWidget(self.settings_panel)   # index 2 (Settings)
 
@@ -3216,6 +3446,7 @@ class Dashboard(QMainWindow):
         self._rate = RateGroupTracker()
         self._reset_notifier = ResetNotifier()
         self._approaching_notifier = ApproachingNotifier()
+        self._auth_notifier = AuthNotifier()
         # Idle poll back-off: track the last time a local session was active, and
         # whether the poll is currently slowed. Start "active" so a fresh launch
         # polls normally until the idle window elapses.
@@ -3682,10 +3913,10 @@ class Dashboard(QMainWindow):
             self.stat_spend.setText("$0.00")
             self.stat_spend_sub.setText("Pay-as-you-go off")
         self._render_roi()
-        # Per-model usage windows the API reports (e.g. Weekly · Fable 5). The
-        # overall 5h/7d windows aren't repeated — they're on the Dashboard.
-        # Insertion order (don't sort) keeps rows from reshuffling per poll.
-        windows = [(f"Weekly · {m}", p) for m, p in s.model_windows.items()]
+        # Scoped usage windows the API reports (e.g. Weekly · Fable) — every
+        # one, ticked on the Dashboard or not. The overall 5h/7d windows aren't
+        # repeated here. API order (don't sort) keeps rows from reshuffling.
+        windows = [(w.label, w.pct) for w in self._scoped.windows]
         self.stat_windows.set_data(windows, sort=False)
         self._update_burn(s)
 
@@ -3895,6 +4126,36 @@ class Dashboard(QMainWindow):
         outer.addWidget(reset)
         return outer, label, pct, bar, reset
 
+    def _make_scoped_row(self):
+        outer, label, pct, bar, reset = self._build_row("")
+        # A widget's layout gets default margins; the SESSION/WEEKLY rows are
+        # bare layouts with none, so without this the row sits inset from them.
+        outer.setContentsMargins(0, 0, 0, 0)
+        row = QWidget()
+        row.setLayout(outer)
+        return row, (label, pct, bar, reset)
+
+    @staticmethod
+    def _render_scoped_row(parts, window, minutes: int, warn_at: int) -> None:
+        label, pct, bar, reset = parts
+        # No token figure: the local transcripts can't be split per limit.
+        apply_overage_bar(label, pct, bar, window.label.upper(), window.pct, warn_at,
+                          over_tag=SCOPED_OVER_TAG)
+        reset.setText(scoped_reset_text(window, minutes))
+
+    def _scoped_items(self, s: UsageSample) -> list:
+        """``(window, reset_minutes, warn_at)`` for each scoped window ticked in
+        Settings, for every view's rows. Reset minutes count down from the
+        sample the same way as the 5h/7d windows (_tick_countdown), so a scoped
+        window resetting with the weekly one shows the same time."""
+        s_warn, w_warn = bar_warn_thresholds()
+        elapsed_min = int((time.time() - s.timestamp) // 60)
+        return [
+            (w, max(0, w.reset_minutes(s.timestamp) - elapsed_min),
+             scoped_windows.warn_threshold_for(w, s_warn, w_warn))
+            for w in scoped_windows.shown(self._scoped.windows, self._scoped_shown)
+        ]
+
     def _start_poller(self) -> None:
         self._poller = UsagePoller(interval_seconds=app_settings.get_poll_interval())
         self._poller.sample.connect(self._on_sample)
@@ -4051,6 +4312,9 @@ class Dashboard(QMainWindow):
     def _start_mock(self) -> None:
         self._mock_pct = 12
         self._mock_sample_timer = QTimer(self)
+        from datetime import datetime, timezone
+        mock_weekly_reset = datetime.fromtimestamp(
+            time.time() + (4 * 24 * 60 + 6 * 60) * 60, timezone.utc).isoformat()
 
         def sample_tick():
             # Cycle 0..129 so both windows cross 100% — the per-window red
@@ -4071,7 +4335,15 @@ class Dashboard(QMainWindow):
                 plan_tier="default_claude_max_5x",
                 extra_usage_enabled=True,
                 extra_usage_used_usd=round(self._mock_pct * 0.3, 2),
-                model_windows={"Opus": 62, "Sonnet": 18, "Fable 5": 41},
+                # Shaped like the live API (limits[] names the model "Fable").
+                # Fable cycles so its row's yellow/red states show too. Only a
+                # window the live API really reports: mock mode uses the real
+                # settings, and Settings remembers every window it has seen.
+                scoped_windows=scoped_windows.windows_from_limits([
+                    {"group": "weekly", "percent": (self._mock_pct + 30) % 130,
+                     "resets_at": mock_weekly_reset,
+                     "scope": {"model": {"display_name": "Fable"}}},
+                ]),
             ))
         self._mock_sample_timer.timeout.connect(sample_tick)
         self._mock_sample_timer.start(800)
@@ -4230,7 +4502,12 @@ class Dashboard(QMainWindow):
         # for. Gated on the line being on screen -- opening the Connection tab
         # re-renders it anyway, so this only has to serve someone already
         # sitting on the page.
+        # Hand the poller's verdict to Settings before it re-renders, so the
+        # Connection tab can't promise an auto-refresh that has been stopped.
+        self.settings_panel.set_reauth_needed(s.status == STATUS_REAUTH_NEEDED)
         self._refresh_token_status_if_watched()
+        if s.ok:
+            self._observe_scoped(s)
         # Feed every sample (incl. errors) so the notifiers can ignore them
         # without disturbing their baselines.
         decision = self._reset_notifier.observe(s)
@@ -4240,19 +4517,30 @@ class Dashboard(QMainWindow):
             session_threshold=app_settings.get_approaching_session_pct(),
             weekly_threshold=app_settings.get_approaching_weekly_pct(),
             overage_enabled=app_settings.get_overage_alert_enabled(),
+            scoped=scoped_windows.shown(self._scoped.windows, self._scoped_shown),
         )
+        # Dispatched here, before the not-ok early return below, because the
+        # alert that matters most fires on exactly those samples.
+        auth_alert = self._auth_notifier.observe(
+            s, enabled=app_settings.get_auth_notify())
+        if auth_alert is not None:
+            self._dispatch_auth_alert(auth_alert)
         self._last_sample = s
         self.usage_history.record(s)   # ring + throttled disk log (skips errors)
         self._maybe_backoff_poll()     # adjust cadence to local session activity
         if not s.ok:
             self._apply_status_badge(s.status)
-            self._tray.setToolTip(f"Clawdmeter - {s.status}")
+            # Same wording as the badge, so the tray and the window can't
+            # disagree — and so the tooltip stops reading as a raw status slug.
+            failure = FAILURE_BADGES.get((s.status or "").lower())
+            self._tray.setToolTip(f"Clawdmeter - {failure[0] if failure else s.status}")
             self._last_tooltip = ""  # force a fresh stats tooltip on recovery
             return
 
         # Each window handles its own overage: once 5h / 7d crosses 100% the bar
         # restarts red and a red OVERAGE tag joins its title.
         self._render_usage_bars(s)
+        self._set_full_scoped_rows(self._scoped_items(s))
 
         self._refresh_reset_lines(
             s, s.session_reset_minutes, s.weekly_reset_minutes)
@@ -4288,17 +4576,59 @@ class Dashboard(QMainWindow):
         body = f"{which} limit has reset — you can resume."
         self._deliver_alert("Claude limit reset", body)
 
+    def _observe_scoped(self, s: UsageSample) -> None:
+        """Take an OK sample's scoped windows: hold the last-known list (a
+        failed usage request, None, keeps it), and remember any newly reported
+        window so Settings can offer its checkbox."""
+        self._scoped.observe(s.scoped_windows)
+        if s.scoped_windows is None:
+            return
+        seen = app_settings.get_scoped_seen()
+        merged = scoped_windows.merge_seen(seen, s.scoped_windows)
+        if merged != seen:
+            app_settings.set_scoped_seen(merged)
+        self.settings_panel.set_scoped_windows(
+            merged, [w.key for w in s.scoped_windows])
+
+    def _apply_scoped_view(self) -> None:
+        """A scoped-window checkbox changed in Settings: re-render every view's
+        rows from the last sample now rather than on the next poll."""
+        self._scoped_shown = app_settings.get_scoped_shown()
+        s = self._last_sample
+        if s is None or not s.ok:
+            return
+        self._tick_countdown()  # every view's rows + reset lines, current times
+
+    def _set_full_scoped_rows(self, items) -> None:
+        """The full window's scoped rows. They take their height from the
+        mascot area (the window is not resized), and the shelf's resize event
+        can arrive before its viewport has shrunk — measured: a 248px mascot
+        left in a 185px viewport, clipped. So once the layout pass the change
+        queues has run, re-size the mascots to the viewport they really have."""
+        if self.scoped_rows.set_windows(items):
+            QTimer.singleShot(0, self.shelf.relayout_tiles)
+
     def _fire_approaching_notification(self, events: list) -> None:
         """Surface approaching-limit / overage events via the shared channels."""
         overage = any(e.kind == "overage" for e in events)
-        title = "Claude overage started" if overage else "Approaching Claude limit"
-        lines = [
-            f"{e.window} passed 100% — now using paid credits."
-            if e.kind == "overage"
-            else f"{e.window} is at {e.pct}% of your limit."
-            for e in events
-        ]
-        self._deliver_alert(title, "\n".join(lines))
+        reached = any(e.kind == "reached" for e in events)
+        if overage:
+            title = "Claude overage started"
+        elif reached:
+            title = "Claude limit reached"
+        else:
+            title = "Approaching Claude limit"
+
+        def line(e) -> str:
+            if e.kind == "overage":
+                return f"{e.window} passed 100% — now using paid credits."
+            if e.kind == "reached":
+                # A scoped window: what happens past 100% is unverified, so say
+                # only what is known. See approaching_notify.LimitEvent.
+                return f"{e.window} reached 100% of its limit."
+            return f"{e.window} is at {e.pct}% of your limit."
+
+        self._deliver_alert(title, "\n".join(line(e) for e in events))
 
     def _deliver_alert(self, title: str, body: str) -> None:
         """Send an alert over the user's chosen channels (shared by reset and
@@ -4632,6 +4962,16 @@ class Dashboard(QMainWindow):
             self._remember_settled_size()
             self._size_save_timer.start()
 
+    def _dispatch_auth_alert(self, alert) -> None:
+        """Say once that usage can't be read, and once when it can again.
+
+        Goes through _deliver_alert like the reset and approaching alerts, so
+        it honours the channels the user already configured — including a
+        push-only setup, which is the one that reaches someone who is not
+        looking at the window. That is the whole point of this alert.
+        """
+        self._deliver_alert(alert.title, alert.body)
+
     def _apply_status_badge(self, status: str) -> None:
         """Show/hide the bottom-left rate-limit badge and reflow the window.
 
@@ -4640,9 +4980,22 @@ class Dashboard(QMainWindow):
         container is hidden when there's nothing to say so the WEEKLY bar
         sits tight against the bottom; minimum window height grows by the
         badge row's footprint when it appears.
+
+        A FAILED poll carries one of poller's STATUS_* values instead, and those
+        are matched exactly, ahead of the substring checks. They have to say
+        something: before this, a failed poll fell through to the else branch
+        and CLEARED the badge, so an expired token left the 5h / 7d bars frozen
+        on their last good values with no explanation anywhere in the window.
         """
         s = (status or "").lower()
-        if "reject" in s or "block" in s:
+        failure = FAILURE_BADGES.get(s)
+        if failure:
+            text, icon, level = failure
+            self.status_text.setText(text)
+            self.status_icon.setText(icon)
+            self.status_text.setProperty("level", level)
+            has_badge = True
+        elif "reject" in s or "block" in s:
             self.status_text.setText("Limit reached")
             self.status_icon.setText("❌")
             self.status_text.setProperty("level", "block")
@@ -4691,7 +5044,9 @@ class Dashboard(QMainWindow):
         sr = max(0, s.session_reset_minutes - elapsed_min)
         wr = max(0, s.weekly_reset_minutes - elapsed_min)
         self._refresh_reset_lines(s, sr, wr)
-        self.mini.set_resets(sr, wr)
+        scoped = self._scoped_items(s)
+        self._set_full_scoped_rows(scoped)
+        self.mini.set_resets(sr, wr, scoped)
         self._update_compact_usage(s, sr, wr)
         self._set_tray_tooltip(s.session_pct, sr, s.weekly_pct, wr)
 
@@ -4828,6 +5183,7 @@ class Dashboard(QMainWindow):
         self.mini.update_usage(
             s.session_pct, s.weekly_pct,
             s.session_reset_minutes, s.weekly_reset_minutes,
+            self._scoped_items(s),
         )
 
     # The title-bar button cycles forward (full -> compact -> mini -> full);
@@ -4893,6 +5249,7 @@ class Dashboard(QMainWindow):
         if s is None or not getattr(s, "ok", False):
             return
         self._render_usage_bars(s)
+        self._set_full_scoped_rows(self._scoped_items(s))
         self._sync_mini(s)
         self._update_compact_usage(
             s, s.session_reset_minutes, s.weekly_reset_minutes)
@@ -5016,12 +5373,14 @@ class Dashboard(QMainWindow):
             cv.update_usage(s,
                             max(0, s.session_reset_minutes - e),
                             max(0, s.weekly_reset_minutes - e),
-                            app_settings.get_show_token_usage())
+                            app_settings.get_show_token_usage(),
+                            self._scoped_items(s))
 
     def _update_compact_usage(self, s, sr: int, wr: int) -> None:
         cv = getattr(self, "compact_view", None)
         if cv is not None and cv.isVisible():
-            cv.update_usage(s, sr, wr, app_settings.get_show_token_usage())
+            cv.update_usage(s, sr, wr, app_settings.get_show_token_usage(),
+                            self._scoped_items(s))
 
     def _show_window(self) -> None:
         """Bring the app to the front for a tray click / second launch. Restores

@@ -4,7 +4,7 @@ Covers what changed once the Claude desktop app, rather than the `claude` CLI,
 became the usual way in: the CLI no longer keeps ~/.claude/.credentials.json
 fresh, so Clawdmeter has to refresh like the CLI does -- early, under the CLI's
 refresh lock, standing down when someone else already rotated the tokens, and
-never re-sending a refresh token the endpoint rejected.
+re-polling straight away when the API rejects a token that looked valid.
 
 Run with `python -m pytest tests/ -q`.
 """
@@ -53,9 +53,7 @@ def _clean_dead_tokens(monkeypatch):
     # token_refresh imports httpx lazily, and some other test modules leave a
     # stand-in httpx in sys.modules; make sure the lazy import sees the real one.
     monkeypatch.setitem(sys.modules, "httpx", httpx)
-    tr._dead_refresh_tokens.clear()
     yield
-    tr._dead_refresh_tokens.clear()
 
 
 def _mock_http(monkeypatch, handler):
@@ -115,14 +113,6 @@ def test_falls_back_to_legacy_endpoint_on_404(monkeypatch, cred):
     assert [str(c.url) for c in calls] == list(tr.OAUTH_TOKEN_URLS)
 
 
-def test_refreshes_before_expiry(cred):
-    path, write = cred
-    write(expires=_now_ms() + 60_000)          # 1 min left -> inside the window
-    assert tr.is_expired(path)
-    write(expires=_now_ms() + 3_600_000)       # 1 h left -> leave it alone
-    assert not tr.is_expired(path)
-
-
 def test_busy_lock_skips_without_network(monkeypatch, cred):
     path, _ = cred
     calls = _mock_http(monkeypatch, _ok_token)
@@ -130,7 +120,7 @@ def test_busy_lock_skips_without_network(monkeypatch, cred):
 
     res = tr.refresh(path)
 
-    assert not res.ok and res.busy
+    assert not res.ok and res.outcome is tr.RefreshOutcome.BUSY
     assert calls == []
     assert _blk(path)["accessToken"] == "old"
     assert (path.parent / tr.LOCK_NAME).exists()   # not ours to remove
@@ -153,31 +143,34 @@ def test_stands_down_when_token_already_rotated(monkeypatch, cred):
     calls = _mock_http(monkeypatch, _ok_token)
     write(access="rotated-by-cli", expires=_now_ms() + 3_600_000)
 
-    res = tr.refresh(path, force=True, seen_access="old")
+    res = tr.refresh(path, seen_access="old")
 
     assert res.ok
     assert calls == []
 
 
-def test_not_expired_is_a_noop_unless_forced(monkeypatch, cred):
-    path, write = cred
-    write(expires=_now_ms() + 3_600_000)
-    calls = _mock_http(monkeypatch, _ok_token)
-
-    assert tr.refresh(path).ok and calls == []
-    assert tr.refresh(path, force=True).ok and len(calls) == 1
-
-
-def test_rejected_refresh_token_is_not_resent(monkeypatch, cred):
+def test_rejected_refresh_token_reports_rejected(monkeypatch, cred):
     path, _ = cred
-    calls = _mock_http(monkeypatch, lambda r: httpx.Response(400, json={"error": "invalid_grant"}))
+    _mock_http(monkeypatch, lambda r: httpx.Response(400, json={"error": "invalid_grant"}))
 
-    first = tr.refresh(path)
-    second = tr.refresh(path)
+    res = tr.refresh(path)
 
-    assert not first.ok and first.http_status == 400
-    assert not second.ok and "sign in again" in second.status
-    assert len(calls) == 1
+    assert not res.ok and res.outcome is tr.RefreshOutcome.REJECTED
+
+
+def test_busy_auto_refresh_is_silent_and_keeps_cooldown(monkeypatch, cred):
+    path, _ = cred
+    monkeypatch.setenv("CLAUDE_CREDENTIALS_PATH", str(path))
+    (path.parent / tr.LOCK_NAME).mkdir()
+    p = poller.UsagePoller()
+    emitted = []
+    p.refresh_status.connect(emitted.append)
+
+    p._do_refresh(manual=False)
+
+    assert emitted == []
+    assert p._cooldown == p.REFRESH_COOLDOWN_MIN
+    assert not p._refresh_blocked
 
 
 def test_poller_recovers_from_401_with_valid_looking_expiry(monkeypatch, cred):
@@ -201,7 +194,7 @@ def test_poller_recovers_from_401_with_valid_looking_expiry(monkeypatch, cred):
     _mock_http(monkeypatch, handler)
     p = poller.UsagePoller()
     first = poller._poll_once("old")
-    assert first.auth_failed
+    assert first.status == poller.STATUS_AUTH_EXPIRED
 
     recovered = p._recover_from_401("old")
 

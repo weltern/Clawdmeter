@@ -637,6 +637,17 @@ QWidget#root {
     border: 1px solid #1f2937;
 }
 
+/* Tooltips (mascot hover token breakdown, long-title reveals, the stats-graph
+   hover, etc.) follow the theme instead of the pale system default. No
+   border-radius: a Qt tooltip is an opaque rectangular window, so a rounded
+   border would leave square corners showing through. */
+QToolTip {
+    background-color: #1f2937;
+    color: #e6edf3;
+    border: 1px solid #374151;
+    padding: 5px 8px;
+}
+
 QWidget#titleBar { background-color: #0a0d12; }
 QLabel#titleAppName {
     font-size: 12px; color: #e6edf3; font-weight: 600; letter-spacing: 1px;

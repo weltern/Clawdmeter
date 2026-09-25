@@ -17,7 +17,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -26,6 +26,7 @@ from PySide6.QtCore import QThread, Signal
 import app_settings
 import macos_keychain
 import token_refresh
+from scoped_windows import ScopedWindow, windows_from_limits
 from transcript import account_window_tokens
 
 API_URL = "https://api.anthropic.com/v1/messages"
@@ -47,6 +48,25 @@ API_BODY = {
 
 DEFAULT_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 POLL_INTERVAL_SECONDS = 60
+
+# Status values for a poll that FAILED. The success path carries Anthropic's own
+# `anthropic-ratelimit-unified-5h-status` instead ("allowed", "allowed_warning",
+# "rejecting", ...), so these are deliberately distinct from those words — the
+# dashboard matches the rate-limit ones by substring.
+#
+# These exist because every failure used to collapse into a bare "error", which
+# the dashboard badge had no branch for and therefore rendered as *nothing*: an
+# expired token looked identical to a dashboard that had quietly stopped
+# updating. The failure kind is the whole difference between "re-authenticate"
+# and "wait for your network to come back".
+STATUS_NO_TOKEN = "no-token"
+STATUS_AUTH_EXPIRED = "auth-expired"
+STATUS_HTTP_ERROR = "http-error"
+STATUS_OFFLINE = "offline"
+# Expired AND the refresh token was refused, so no automatic recovery exists.
+# Split from STATUS_AUTH_EXPIRED because the remedy is different: that one
+# resolves itself on the next refresh, this one needs the user to sign in.
+STATUS_REAUTH_NEEDED = "reauth-needed"
 
 
 @dataclass
@@ -75,10 +95,10 @@ class UsageSample:
     extra_usage_enabled: bool = False
     extra_usage_used_usd: float = 0.0       # real extra-usage spend, in dollars
     extra_usage_limit_usd: float | None = None  # monthly cap in $, None = uncapped
-    model_windows: dict = field(default_factory=dict)  # {model display name: percent}
-    # True when the probe was rejected with 401 -- the token is expired or was
-    # rotated out from under us, whatever its stored expiresAt claims.
-    auth_failed: bool = False
+    # Scoped limits beside the 5h/7d windows (e.g. Weekly · Fable). None means
+    # the usage request didn't succeed this poll — NOT "no scoped limits",
+    # which is an empty list — so the dashboard can keep the last-known ones.
+    scoped_windows: list[ScopedWindow] | None = None
 
 
 def credentials_path() -> Path:
@@ -193,8 +213,8 @@ def usage_fields_from_json(usage: dict | None, profile: dict | None) -> dict:
     Pure (no network) and defensive: every field falls back to a sane default on
     missing/null input, so a partial or changed response can't crash a poll.
     Money comes from `spend.used` (amount_minor / 10**exponent) — never read the
-    minor-unit integer as dollars. Per-model windows come from the `limits[]`
-    array's model-scoped entries.
+    minor-unit integer as dollars. Scoped windows come from the `limits[]`
+    array's scoped entries (see scoped_windows.windows_from_limits).
     """
     usage = usage or {}
     profile = profile or {}
@@ -215,19 +235,12 @@ def usage_fields_from_json(usage: dict | None, profile: dict | None) -> dict:
     else:
         limit_usd = None
 
-    windows: dict[str, int] = {}
-    for entry in usage.get("limits") or []:
-        model = ((entry.get("scope") or {}).get("model") or {}).get("display_name")
-        pct = entry.get("percent")
-        if model and isinstance(pct, (int, float)):
-            windows[model] = int(pct)
-
     return {
         "plan_tier": org.get("rate_limit_tier"),
         "extra_usage_enabled": bool(spend.get("enabled")),
         "extra_usage_used_usd": round(float(used_usd), 2),
         "extra_usage_limit_usd": round(float(limit_usd), 2) if limit_usd is not None else None,
-        "model_windows": windows,
+        "scoped_windows": windows_from_limits(usage.get("limits")),
     }
 
 
@@ -246,18 +259,38 @@ def _poll_once(token: str) -> UsageSample:
             # K1: enrich with the OAuth usage + profile endpoints (plan tier,
             # extra-usage spend, per-model windows) on the same client/cadence.
             # Non-fatal: any failure leaves the header-derived sample intact.
+            # raise_for_status on usage only: its error body parses as JSON too,
+            # and would read as "no scoped windows" rather than "didn't find
+            # out". A profile error body just leaves the plan tier unknown.
             try:
-                usage = http.get(USAGE_URL, headers=headers).json()
+                usage = http.get(USAGE_URL, headers=headers).raise_for_status().json()
                 profile = http.get(PROFILE_URL, headers=headers).json()
                 for k, v in usage_fields_from_json(usage, profile).items():
                     setattr(sample, k, v)
             except (httpx.HTTPError, ValueError, TypeError):
                 pass
     except httpx.HTTPStatusError as exc:
-        return UsageSample(0, 0, 0, 0, "error", False, str(exc), now,
-                           auth_failed=exc.response.status_code == 401)
+        # The server answered and refused. Caught before HTTPError below:
+        # HTTPStatusError is a subclass of it.
+        #
+        # 401 and 403 are NOT the same thing and must not claim to be. 401 is
+        # the token having expired, which a refresh fixes by itself. 403 is
+        # forbidden — a revoked token, or an org policy — where asserting an
+        # expiry would state something unestablished and send the user to fix
+        # the wrong thing. "Sign in again" is true under either reading of a
+        # 403, and it is the only remedy this app can offer for one.
+        code = exc.response.status_code
+        if code == 401:
+            status = STATUS_AUTH_EXPIRED
+        elif code == 403:
+            status = STATUS_REAUTH_NEEDED
+        else:
+            status = STATUS_HTTP_ERROR
+        return UsageSample(0, 0, 0, 0, status, False, str(exc), now)
     except httpx.HTTPError as exc:
-        return UsageSample(0, 0, 0, 0, "error", False, str(exc), now)
+        # Transport-level: timeout, DNS failure, connection refused. Nothing is
+        # wrong with the token, so it must not read as an auth problem.
+        return UsageSample(0, 0, 0, 0, STATUS_OFFLINE, False, str(exc), now)
     # Sum the local transcripts' input+output over the 5h/7d windows — only when
     # the token display is on, so we don't scan files for nothing.
     if app_settings.get_show_token_usage():
@@ -282,7 +315,11 @@ class UsagePoller(QThread):
     refresh_status = Signal(object)  # token_refresh.RefreshResult
 
     REFRESH_COOLDOWN_MIN = 60.0    # seconds between auto attempts
-    REFRESH_COOLDOWN_MAX = 900.0   # backoff ceiling after a 429
+    REFRESH_COOLDOWN_MAX = 900.0   # backoff ceiling for transient trouble
+    # A 429 ceiling of 15 minutes means ~4 attempts an hour against an endpoint
+    # that throttles hard — over a day and a half of a dead token that is well
+    # over a hundred requests, which plausibly keeps its own lockout open.
+    REFRESH_THROTTLED_MAX = 4 * 3600.0
 
     def __init__(self, interval_seconds: int = POLL_INTERVAL_SECONDS, parent=None) -> None:
         super().__init__(parent)
@@ -293,6 +330,17 @@ class UsagePoller(QThread):
         self._manual_refresh = False
         self._last_refresh_attempt = 0.0
         self._cooldown = self.REFRESH_COOLDOWN_MIN
+        # Whether a REJECTED refresh has switched automatic refreshes off: the
+        # stored refresh token is dead and retrying it can only fail. Its own
+        # boolean, NOT inferred from the expiry below, because that expiry is
+        # legitimately None for a credentials file with no `expiresAt` — which
+        # is exactly the malformed-file case that produces a REJECTED. Inferring
+        # the state from a nullable value made the block silently not engage.
+        self._refresh_blocked = False
+        # The expiry the block was taken against (may be None when unknown).
+        # A CHANGE here means somebody signed in again, which clears the block
+        # without anything having to notify us.
+        self._blocked_expiry_ms: int | None = None
 
     def stop(self) -> None:
         self._stop = True
@@ -317,20 +365,74 @@ class UsagePoller(QThread):
         """Ask the poll thread to refresh the token ASAP (bypasses cooldown)."""
         self._manual_refresh = True
 
-    def _do_refresh(self, manual: bool, force: bool = False,
-                    seen_access: str | None = None) -> None:
+    def _do_refresh(self, manual: bool, seen_access: str | None = None) -> None:
         self._last_refresh_attempt = time.time()
-        result = token_refresh.refresh(credentials_path(), force=force,
-                                       seen_access=seen_access)
-        if result.ok:
-            self._cooldown = self.REFRESH_COOLDOWN_MIN
-        elif result.http_status == 429 and not manual:
-            self._cooldown = min(self._cooldown * 2, self.REFRESH_COOLDOWN_MAX)
-        if result.busy and not manual:
-            # Claude Code holds the lock and is refreshing the same file; its
-            # result shows up on a later read. Not an error worth surfacing.
+        result = token_refresh.refresh(credentials_path(), seen_access=seen_access)
+        outcome = result.outcome
+        Outcome = token_refresh.RefreshOutcome
+
+        if outcome is Outcome.BUSY and not manual:
+            # Claude Code holds its refresh lock and is renewing this same file;
+            # the result shows up on a later read. Not an error, no backoff.
             return
+        if outcome is Outcome.REFRESHED:
+            self._cooldown = self.REFRESH_COOLDOWN_MIN
+            self._refresh_blocked = False
+            self._blocked_expiry_ms = None
+        elif outcome is Outcome.REJECTED:
+            # Dead refresh token. Stop attempting: it cannot succeed, and each
+            # try is another request against a rate limiter we may already be
+            # behind. A manual attempt still gets through _do_refresh directly.
+            self._refresh_blocked = True
+            self._blocked_expiry_ms = token_refresh.token_expiry_ms(credentials_path())
+        elif manual:
+            pass                       # the user asked; don't punish them with backoff
+        elif outcome is Outcome.THROTTLED:
+            self._cooldown = min(self._cooldown * 2, self.REFRESH_THROTTLED_MAX)
+        else:
+            self._cooldown = min(self._cooldown * 2, self.REFRESH_COOLDOWN_MAX)
+
         self.refresh_status.emit(result)
+
+    def _mark_reauth(self, sample: UsageSample) -> UsageSample:
+        """Upgrade a plain expiry to "sign in again" when nothing can recover it.
+
+        An expired token the next refresh will fix and one whose refresh token
+        is dead look identical from the probe — both are a 401 — but only one
+        of them needs the user to do something. The badge reads this field, so
+        the distinction has to be made before the sample is emitted.
+
+        Lives out here rather than inline in run() so it can be tested; the
+        thread loop is not reachable from a test.
+        """
+        # Two ways there is no automatic recovery: the refresh token was
+        # refused, or this install cannot refresh at all. The second is macOS,
+        # where it is true of EVERY expiry — so the badge there said "Token
+        # expired", implying a refresh that was never coming. That is the same
+        # false promise the Settings line was fixed for, on the one platform
+        # where it is always wrong.
+        if sample.status == STATUS_AUTH_EXPIRED and (
+                self._reauth_needed() or not token_refresh.auto_refresh_supported()):
+            sample.status = STATUS_REAUTH_NEEDED
+        return sample
+
+    def _reauth_needed(self) -> bool:
+        """True while a rejected refresh token is still the one on disk.
+
+        Re-reading the expiry each time is what makes the block self-clearing:
+        signing in again writes a new expiry, and the next poll resumes without
+        anything having to notify us.
+        """
+        if not self._refresh_blocked:
+            return False
+        if token_refresh.token_expiry_ms(credentials_path()) != self._blocked_expiry_ms:
+            # New credentials arrived. Note this is correct when BOTH are None
+            # (None != None is False), so a file that never had an expiry stays
+            # blocked rather than silently unblocking on every poll.
+            self._refresh_blocked = False
+            self._blocked_expiry_ms = None
+            return False
+        return True
 
     def _maybe_auto_refresh(self) -> None:
         if not self._auto_refresh:
@@ -340,9 +442,14 @@ class UsagePoller(QThread):
         # next poll re-reads it. Skip here so we don't emit a refresh failure on
         # every cooldown while a token is expired. (An explicit file override on
         # Mac still takes the normal file path.)
-        if macos_keychain.is_macos() and not os.environ.get("CLAUDE_CREDENTIALS_PATH"):
+        if not token_refresh.auto_refresh_supported():
             return
-        if not token_refresh.is_expired(credentials_path()):
+        if self._reauth_needed():
+            return
+        # needs_refresh, not is_expired: renew while there is still a working
+        # token, so a throttled endpoint has room to be retried before the
+        # dashboard can break.
+        if not token_refresh.needs_refresh(credentials_path()):
             return
         if time.time() - self._last_refresh_attempt < self._cooldown:
             return
@@ -350,18 +457,18 @@ class UsagePoller(QThread):
 
     def _recover_from_401(self, used_token: str) -> UsageSample | None:
         """The API rejected a token its expiresAt called valid. Re-poll with a
-        newer token if one is on disk, else force a refresh (subject to the same
+        newer token if one is on disk, else refresh now (subject to the same
         cooldown as auto-refresh) and re-poll with its result. None = no luck;
         the caller keeps the failed sample."""
         fresh = read_token()
         if fresh and fresh != used_token:
             return _poll_once(fresh)
         if (not self._auto_refresh
-                or (macos_keychain.is_macos()
-                    and not os.environ.get("CLAUDE_CREDENTIALS_PATH"))
+                or not token_refresh.auto_refresh_supported()
+                or self._reauth_needed()
                 or time.time() - self._last_refresh_attempt < self._cooldown):
             return None
-        self._do_refresh(manual=False, force=True, seen_access=used_token)
+        self._do_refresh(manual=False, seen_access=used_token)
         fresh = read_token()
         if fresh and fresh != used_token:
             return _poll_once(fresh)
@@ -378,14 +485,14 @@ class UsagePoller(QThread):
             token = read_token()
             if not token:
                 self.sample.emit(UsageSample(
-                    0, 0, 0, 0, "no-token", False,
+                    0, 0, 0, 0, STATUS_NO_TOKEN, False,
                     f"No token in {token_source_description()}", time.time(),
                 ))
             else:
                 sample = _poll_once(token)
-                if sample.auth_failed:
+                if sample.status == STATUS_AUTH_EXPIRED:
                     sample = self._recover_from_401(token) or sample
-                self.sample.emit(sample)
+                self.sample.emit(self._mark_reauth(sample))
 
             for _ in range(self._interval):
                 if self._stop:

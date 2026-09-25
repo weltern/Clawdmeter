@@ -51,6 +51,19 @@ def test_a_changed_role_actually_swaps_in_the_output():
     assert "#0e1116" not in qss
 
 
+def test_tooltip_is_themed_and_follows_the_palette():
+    # Tooltips (mascot hover, long-title reveal, stats-graph hover) must follow
+    # the theme, not the pale system default. The rule is present, and its
+    # colours swap with the palette's surface / text / border roles.
+    assert "QToolTip {" in build_qss(MIDNIGHT_SALMON)
+    custom = MIDNIGHT_SALMON.with_overrides(
+        surface="#111111", text="#eeeeee", border="#333333")
+    block = build_qss(custom).split("QToolTip {", 1)[1].split("}", 1)[0]
+    assert "background-color: #111111;" in block   # surface role
+    assert "color: #eeeeee;" in block              # text role
+    assert "border: 1px solid #333333;" in block   # border role
+
+
 def test_swap_is_single_pass_no_aliasing():
     # Swap bg <-> surface. A naive sequential .replace() would collapse both to
     # one colour; a single regex pass keeps them distinct.
