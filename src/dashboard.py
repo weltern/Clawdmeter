@@ -4511,7 +4511,14 @@ class Dashboard(QMainWindow):
         # sitting on the page.
         # Hand the poller's verdict to Settings before it re-renders, so the
         # Connection tab can't promise an auto-refresh that has been stopped.
-        self.settings_panel.set_reauth_needed(s.status == STATUS_REAUTH_NEEDED)
+        # Only samples that SAY something about it move it: sign-in-again sets
+        # it, a working poll clears it. An offline or API-error sample in
+        # between knows nothing about the token and used to clear it, so the
+        # tab went back to "wait for auto-refresh" while none was coming.
+        if s.status == STATUS_REAUTH_NEEDED:
+            self.settings_panel.set_reauth_needed(True)
+        elif s.ok:
+            self.settings_panel.set_reauth_needed(False)
         self._refresh_token_status_if_watched()
         if s.ok:
             self._observe_scoped(s)
