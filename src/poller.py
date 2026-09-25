@@ -365,12 +365,16 @@ class UsagePoller(QThread):
         """Ask the poll thread to refresh the token ASAP (bypasses cooldown)."""
         self._manual_refresh = True
 
-    def _do_refresh(self, manual: bool) -> None:
+    def _do_refresh(self, manual: bool, seen_access: str | None = None) -> None:
         self._last_refresh_attempt = time.time()
-        result = token_refresh.refresh(credentials_path())
+        result = token_refresh.refresh(credentials_path(), seen_access=seen_access)
         outcome = result.outcome
         Outcome = token_refresh.RefreshOutcome
 
+        if outcome is Outcome.BUSY and not manual:
+            # Claude Code holds its refresh lock and is renewing this same file;
+            # the result shows up on a later read. Not an error, no backoff.
+            return
         if outcome is Outcome.REFRESHED:
             self._cooldown = self.REFRESH_COOLDOWN_MIN
             self._refresh_blocked = False
@@ -451,6 +455,25 @@ class UsagePoller(QThread):
             return
         self._do_refresh(manual=False)
 
+    def _recover_from_401(self, used_token: str) -> UsageSample | None:
+        """The API rejected a token its expiresAt called valid. Re-poll with a
+        newer token if one is on disk, else refresh now (subject to the same
+        cooldown as auto-refresh) and re-poll with its result. None = no luck;
+        the caller keeps the failed sample."""
+        fresh = read_token()
+        if fresh and fresh != used_token:
+            return _poll_once(fresh)
+        if (not self._auto_refresh
+                or not token_refresh.auto_refresh_supported()
+                or self._reauth_needed()
+                or time.time() - self._last_refresh_attempt < self._cooldown):
+            return None
+        self._do_refresh(manual=False, seen_access=used_token)
+        fresh = read_token()
+        if fresh and fresh != used_token:
+            return _poll_once(fresh)
+        return None
+
     def run(self) -> None:  # QThread entry
         while not self._stop:
             self._wake = False  # cleared each cycle; a wake during this poll re-sets it
@@ -466,7 +489,10 @@ class UsagePoller(QThread):
                     f"No token in {token_source_description()}", time.time(),
                 ))
             else:
-                self.sample.emit(self._mark_reauth(_poll_once(token)))
+                sample = _poll_once(token)
+                if sample.status == STATUS_AUTH_EXPIRED:
+                    sample = self._recover_from_401(token) or sample
+                self.sample.emit(self._mark_reauth(sample))
 
             for _ in range(self._interval):
                 if self._stop:
