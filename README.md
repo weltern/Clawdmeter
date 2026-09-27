@@ -276,9 +276,13 @@ six tabs that each scroll on their own. Here's every setting, grouped by tab.
   through the **Claude desktop app**: the desktop app keeps its own login, so
   unlike the `claude` CLI it never renews `~/.claude/.credentials.json` and
   Clawdmeter has to. It refreshes the same way the CLI does, under the CLI's own
-  refresh lock, so the two never use up each other's refresh token. If the
-  refresh token itself is rejected, Clawdmeter stops retrying and **Sign in
-  again** gets you back in.
+  refresh lock, so the two never use up each other's refresh token. If Claude
+  rejects the token or its refresh token, Clawdmeter stops retrying and **Sign
+  in again** opens Claude Code's own sign-in (`claude auth login`) in a
+  terminal; the new token is picked up on the next poll.
+  **On macOS** the token lives in the login Keychain, which Clawdmeter only
+  reads — it can't refresh it there, so the refresh controls are greyed out.
+  When it expires, run `claude` or use **Sign in again**.
 - **Usage polling** — how often the app checks your usage. Each check is a tiny
   billed API request, so the interval is adjustable from **10 to 600 seconds**
   (60 by default): lower is fresher but makes more requests; higher is gentler on
@@ -301,6 +305,13 @@ channels are shared across every alert.
   throttled), so it stays quiet otherwise.
 
   ![Clawdmeter limit-reset notification — "Claude limit reset" over "Session limit has reset — you can resume."](assets/Screenshot-Session-Limit-Reset.png)
+
+- **When usage can't be read (sign-in problem)** *(on by default)* tells you
+  when the token has expired, been rejected, or can't be found — the session
+  mascots keep working without a token, so the 5h/7d bars quietly freezing is
+  otherwise easy to miss. It fires **once** when it happens (and once more if an
+  expiry turns out to need you to sign in again), then once when usage can be
+  read again. A dropped network or an API hiccup doesn't trigger it.
 
 - **When approaching a limit** warns you *before* you run out — pick a separate
   **% threshold for the 5h session and the 7d week** (50–99%; defaults 90% and
