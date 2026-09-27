@@ -1537,6 +1537,12 @@ class CompactRow(QWidget):
         bot.addWidget(self.sep, 0)
         bot.addWidget(self.target, 1)
         bot.addWidget(self.agents, 0)
+        # The target is capped (max_w), so on a wide row there is slack left
+        # over; without somewhere to put it Qt hands it to the dot/activity
+        # labels and the dot drifts ~30px away from 'IDLE'. A ZERO-stretch
+        # spacer takes only what the capped target can't: with stretch 1 it
+        # would split the slack with the target and elide names sooner.
+        bot.addStretch(0)
         col.addLayout(bot)
 
         h.addLayout(col, 1)

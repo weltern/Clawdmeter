@@ -12,8 +12,10 @@ Landed in commit `52034f4` on `feat/macos-native-window`.
 
 - Flat warm-paper field `#f6f1ea` with subtle deterministic grain
 - Clawd's session-shelf treatment baked around the app icon slot:
-  THINKING-blue (`#5B8DEF`) silhouette glow painted where Finder places the
-  icon, `● THINKING` + `PONDERING ITS NEW HOME` beneath
+  `● THINKING` + `PONDERING ITS NEW HOME` beneath where Finder places the
+  icon. The slot itself is left **bare** — no glow or silhouette behind it
+  (the original blue glow was dropped in `80a9745`, 2026-07-29, because its
+  mascot shape clashed with the rounded tile macOS 26 wraps every app icon in)
 - Four salmon (`#CE7D6B`) chevrons stepping toward Applications
 - One instruction line: *Drag Clawdmeter to Applications*
 
@@ -47,6 +49,8 @@ These are facts, not taste — rediscovering them costs a session:
    mismatch is unavoidable for half the audience and is normal (VS Code,
    Slack, et al. all live with it).
 
-One open verification: the glow-behind-icon trick assumes Finder's `.icns`
-rendering aligns with `assets/icon.png`'s silhouette. Eyeball the first real
-mounted DMG on the Mac VM before it ships in a release.
+With the slot bare there is no icon alignment left to verify. The mounted DMG
+was eyeballed on an Apple Silicon Mac running macOS 26.6.1 (2026-09-27): the
+icon sits cleanly in its Tahoe tile, both labels read, and the chevrons point at
+Applications. Still eyeball it before any release that changes `packaging/`
+art or `assets/icon.*`.
