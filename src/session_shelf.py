@@ -214,10 +214,26 @@ class ScrollingLabel(QWidget):
         # primary text colour rather than baking it at import.
         self._role = None if color else role
         self._color = QColor(color if color else self._role_color(role))
-        self.setFixedHeight(self._fm.height())
+        self._h = self._line_height(self._fm)
+        self.setFixedHeight(self._h)
         self.setMaximumWidth(max_w)
         self._anim = QPropertyAnimation(self, b"scrollOffset", self)
         self._anim.setEasingCurve(QEasingCurve.InOutSine)
+
+    # Glyphs that reach furthest below the baseline in common UI fonts.
+    _DESCENDERS = "_gjpqy"
+
+    @staticmethod
+    def _line_height(fm: QFontMetrics) -> int:
+        """The font's line height, grown if a descender pokes out of it.
+
+        ``height()`` is ascent + descent, and some fonts draw the underscore
+        BELOW their own descent: DejaVu Sans at 10px (Ubuntu's default) is 11px
+        tall with its baseline at 9, but '_' fills rows 10-11, so the bottom
+        row was clipped and "list_issues" read as "list issues". Segoe UI and
+        SF leave room, so this is a no-op there."""
+        below = fm.tightBoundingRect(ScrollingLabel._DESCENDERS).bottom()
+        return max(fm.height(), fm.ascent() + below + 1)
 
     @staticmethod
     def _role_color(role: str) -> str:
@@ -262,10 +278,10 @@ class ScrollingLabel(QWidget):
         return self._text_w() > self._avail()
 
     def sizeHint(self) -> QSize:
-        return QSize(min(self._text_w(), self.maximumWidth()), self._fm.height())
+        return QSize(min(self._text_w(), self.maximumWidth()), self._h)
 
     def minimumSizeHint(self) -> QSize:
-        return QSize(0, self._fm.height())
+        return QSize(0, self._h)
 
     def _refresh_tooltip(self) -> None:
         if self._explicit_tt is not None:
@@ -331,15 +347,20 @@ class ScrollingLabel(QWidget):
         p = QPainter(self)
         p.setFont(self._font)
         p.setPen(self._color)
+        # Top-aligned in the WHOLE widget: any extra height _line_height() added
+        # is room for descenders below the font's line box. drawText() clips to
+        # its rect, so a rect of just the line box (or of an fm.height()-tall
+        # widget, as before) cut the '_' off; centring would push the line down
+        # into the extra room and cut it off again.
         rect = self.rect()
+        valign = Qt.AlignTop
         if not self._overflows():
-            p.drawText(rect, self._align | Qt.AlignVCenter, self._full)
+            p.drawText(rect, self._align | valign, self._full)
         elif self._hovering:
-            y = self._fm.ascent() + (self.height() - self._fm.height()) // 2
-            p.drawText(-self._offset, y, self._full)
+            p.drawText(-self._offset, self._fm.ascent(), self._full)
         else:
             elided = self._fm.elidedText(self._full, Qt.ElideRight, self._avail())
-            p.drawText(rect, self._align | Qt.AlignVCenter, elided)
+            p.drawText(rect, self._align | valign, elided)
         p.end()
 
 
