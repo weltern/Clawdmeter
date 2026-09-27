@@ -25,11 +25,12 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal
+
+from isotime import parse_iso_ts  # noqa: F401 (also re-exported)
 
 TRANSCRIPTS_DIR = Path.home() / ".claude" / "projects"
 POLL_MS = 500
@@ -324,47 +325,6 @@ def project_name_from_cwd(cwd: str | None, transcript_path: Path | None) -> str:
         if parent:
             return parent
     return "unknown"
-
-
-def parse_iso_ts(value: str | None) -> float | None:
-    """Parse a Claude Code event ``timestamp`` (ISO-8601 UTC, e.g.
-    ``"2026-06-14T03:26:31.977Z"``) into an epoch float.
-
-    Returns None when the value is absent or unparseable so callers can fall
-    back to wall-clock time. UTC throughout, so ``time.time() - parse_iso_ts(...)``
-    is the true elapsed seconds regardless of local timezone.
-    """
-    if not isinstance(value, str) or not value:
-        return None
-    txt = value.strip()
-    if txt.endswith("Z"):
-        txt = txt[:-1] + "+00:00"
-
-    def _epoch(s: str) -> float:
-        dt = datetime.fromisoformat(s)
-        # A tz-less timestamp would otherwise be read as LOCAL by .timestamp(),
-        # shifting it by the UTC offset. Claude Code always writes a 'Z', but be
-        # safe: treat a naive value as UTC.
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
-
-    try:
-        return _epoch(txt)
-    except ValueError:
-        pass
-    # Some fromisoformat variants reject odd fractional-second digit counts;
-    # strip the ".<digits>" fraction and retry (tz suffix, if any, is kept).
-    dot = txt.find(".")
-    if dot != -1:
-        end = dot + 1
-        while end < len(txt) and txt[end].isdigit():
-            end += 1
-        try:
-            return _epoch(txt[:dot] + txt[end:])
-        except ValueError:
-            return None
-    return None
 
 
 def session_label(

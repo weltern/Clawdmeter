@@ -11,7 +11,8 @@ disagree about what is showing.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+
+from isotime import parse_iso_ts
 
 
 @dataclass(frozen=True)
@@ -57,12 +58,11 @@ def _scope_name(scope) -> str | None:
 def _parse_resets_at(value) -> float | None:
     """ISO-8601 ``resets_at`` -> whole epoch seconds (the rate-limit headers
     carry whole seconds, so the two countdowns round identically)."""
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        return float(int(datetime.fromisoformat(value).timestamp()))
-    except ValueError:
-        return None
+    # The shared parser, not a bare fromisoformat: Python 3.10 (the Linux
+    # release build) rejects a trailing 'Z' and some fraction widths, which
+    # would have shown "reset time not reported" on Linux alone.
+    ts = parse_iso_ts(value)
+    return None if ts is None else float(int(ts))
 
 
 def windows_from_limits(limits) -> list[ScopedWindow]:

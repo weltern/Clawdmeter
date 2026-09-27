@@ -92,6 +92,21 @@ def test_unparseable_reset_is_unknown_not_zero_minutes_ago():
     assert w.reset_minutes(0.0) == 0
 
 
+@pytest.mark.parametrize("stamp", [
+    "2026-09-17T21:00:00.543186+00:00",   # the live API's shape today
+    "2026-09-17T21:00:00Z",               # 'Z' — rejected by 3.10's fromisoformat
+    "2026-09-17T21:00:00.543Z",           # millisecond fraction + 'Z'
+])
+def test_reset_time_parses_on_every_python_the_builds_use(stamp):
+    """Release-review finding: a bare fromisoformat() handled only the live
+    shape on Python 3.10, which the Linux release build runs, so any other
+    ISO form would read "reset time not reported" on Linux alone."""
+    (w,) = windows_from_limits([{"group": "weekly", "percent": 3, "resets_at": stamp,
+                                 "scope": {"model": {"display_name": "Opus"}}}])
+    want = datetime(2026, 9, 17, 21, 0, 0, tzinfo=timezone.utc).timestamp()
+    assert w.resets_at == want
+
+
 def test_reset_minutes_round_exactly_like_the_header_window():
     # 3000.4967 min to the whole-second reset -> 3000. Had the .543s fraction
     # been kept it would be 3000.5057 -> 3001, a minute off the WEEKLY bar that

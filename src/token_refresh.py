@@ -349,6 +349,16 @@ def refresh_lock(cred_dir: Path):
                     pass
 
 
+def _invalid_grant(resp) -> bool:
+    """Is this token-endpoint error OAuth's ``invalid_grant`` — the refresh
+    token itself is dead — rather than a request the server couldn't use?"""
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get("error") == "invalid_grant"
+
+
 def _post_refresh(http, body: dict):
     """POST to the token endpoint, falling back to the legacy host only when the
     current one is unreachable or doesn't route the request."""
@@ -454,9 +464,18 @@ def _refresh_locked(path: Path, *, timeout: float,
     if resp.status_code == 429:
         return RefreshResult(False, "Rate limited by token endpoint — backing off", 429,
                              outcome=RefreshOutcome.THROTTLED)
-    if resp.status_code in (400, 401):
+    if resp.status_code == 401 or (resp.status_code == 400 and _invalid_grant(resp)):
         # The server read the refresh token and refused it: expired, or already
         # rotated by whoever refreshed last. No amount of retrying fixes that.
+        #
+        # A 400 counts only with OAuth's `invalid_grant`. The endpoint answers
+        # a request it can't parse with a 400 too, under a different body
+        # (measured 2026-09-27: a fake refresh token -> 400 {"error":
+        # "invalid_grant"}; no grant_type -> 400 {"type": "error", "error":
+        # {"type": "invalid_request_error"}}). Treating every 400 as a dead
+        # token would, after an endpoint change, stop refreshing for everyone
+        # and tell them to sign in — which would not fix it. That one falls
+        # through to ERROR below and keeps retrying with backoff.
         return RefreshResult(
             False, f"Refresh token rejected (HTTP {resp.status_code}) — sign in again",
             resp.status_code, outcome=RefreshOutcome.REJECTED,

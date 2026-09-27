@@ -75,6 +75,30 @@ def test_a_network_or_api_failure_does_not_forget_it(dash, status):
     assert dash.settings_panel._reauth_needed
 
 
+def test_a_rejected_token_the_file_calls_valid_can_still_sign_in(dash, monkeypatch, tmp_path):
+    """Found in the release review. A revoked token (401 -> refresh REJECTED)
+    or a 403 still carries a future expiresAt, so gating on the expiry alone
+    disabled Sign in again as "still valid" and the status line promised an
+    automatic refresh — while the badge and the alert sent the user there."""
+    import json
+    cred = tmp_path / ".credentials.json"
+    cred.write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": "a", "refreshToken": "r",
+        "expiresAt": int((time.time() + 5 * 3600) * 1000)}}), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CREDENTIALS_PATH", str(cred))
+    panel = dash.settings_panel
+
+    panel.refresh_token_status()
+    assert not panel.reauth_btn.isEnabled()          # control: healthy token
+
+    dash._on_sample(_bad(poller.STATUS_REAUTH_NEEDED))
+    panel.refresh_token_status()
+
+    assert panel.reauth_btn.isEnabled(), panel.reauth_btn.toolTip()
+    status = panel.token_status.text()
+    assert "Sign in again" in status and "automatically" not in status, status
+
+
 def test_a_working_poll_clears_it(dash):
     dash._on_sample(_bad(poller.STATUS_REAUTH_NEEDED))
     dash._on_sample(_bad(poller.STATUS_OFFLINE))
