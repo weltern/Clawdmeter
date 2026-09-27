@@ -220,19 +220,22 @@ class ScrollingLabel(QWidget):
         self._anim = QPropertyAnimation(self, b"scrollOffset", self)
         self._anim.setEasingCurve(QEasingCurve.InOutSine)
 
-    # Glyphs that reach furthest below the baseline in common UI fonts.
-    _DESCENDERS = "_gjpqy"
-
     @staticmethod
     def _line_height(fm: QFontMetrics) -> int:
-        """The font's line height, grown if a descender pokes out of it.
+        """The font's line height, grown if the underscore pokes out of it.
 
-        ``height()`` is ascent + descent, and some fonts draw the underscore
-        BELOW their own descent: DejaVu Sans at 10px (Ubuntu's default) is 11px
-        tall with its baseline at 9, but '_' fills rows 10-11, so the bottom
-        row was clipped and "list_issues" read as "list issues". Segoe UI and
-        SF leave room, so this is a no-op there."""
-        below = fm.tightBoundingRect(ScrollingLabel._DESCENDERS).bottom()
+        ``height()`` is ascent + descent, and DejaVu Sans (Ubuntu's default UI
+        font) draws '_' BELOW its own descent: at 10px it is 11px tall with the
+        baseline at 9 and the underscore on row 11, so it was clipped away and
+        "list_issues" read as "list issues".
+
+        Measures '_' ONLY. g/j/p/q/y report a tight box a row or two lower than
+        they actually draw on macOS's SF, so including them grew every Mac
+        label by 1px while the old height already showed them in full
+        (measured). At the sizes the app uses (10px, 12px bold, 13px bold) this
+        returns height() unchanged on Segoe UI and SF; on DejaVu it adds 1px
+        (only 10px was actually clipping — the tight box is conservative)."""
+        below = fm.tightBoundingRect("_").bottom()
         return max(fm.height(), fm.ascent() + below + 1)
 
     @staticmethod
