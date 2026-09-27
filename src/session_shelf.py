@@ -214,10 +214,29 @@ class ScrollingLabel(QWidget):
         # primary text colour rather than baking it at import.
         self._role = None if color else role
         self._color = QColor(color if color else self._role_color(role))
-        self.setFixedHeight(self._fm.height())
+        self._h = self._line_height(self._fm)
+        self.setFixedHeight(self._h)
         self.setMaximumWidth(max_w)
         self._anim = QPropertyAnimation(self, b"scrollOffset", self)
         self._anim.setEasingCurve(QEasingCurve.InOutSine)
+
+    @staticmethod
+    def _line_height(fm: QFontMetrics) -> int:
+        """The font's line height, grown if the underscore pokes out of it.
+
+        ``height()`` is ascent + descent, and DejaVu Sans (Ubuntu's default UI
+        font) draws '_' BELOW its own descent: at 10px it is 11px tall with the
+        baseline at 9 and the underscore on row 11, so it was clipped away and
+        "list_issues" read as "list issues".
+
+        Measures '_' ONLY. g/j/p/q/y report a tight box a row or two lower than
+        they actually draw on macOS's SF, so including them grew every Mac
+        label by 1px while the old height already showed them in full
+        (measured). At the sizes the app uses (10px, 12px bold, 13px bold) this
+        returns height() unchanged on Segoe UI and SF; on DejaVu it adds 1px
+        (only 10px was actually clipping — the tight box is conservative)."""
+        below = fm.tightBoundingRect("_").bottom()
+        return max(fm.height(), fm.ascent() + below + 1)
 
     @staticmethod
     def _role_color(role: str) -> str:
@@ -262,10 +281,10 @@ class ScrollingLabel(QWidget):
         return self._text_w() > self._avail()
 
     def sizeHint(self) -> QSize:
-        return QSize(min(self._text_w(), self.maximumWidth()), self._fm.height())
+        return QSize(min(self._text_w(), self.maximumWidth()), self._h)
 
     def minimumSizeHint(self) -> QSize:
-        return QSize(0, self._fm.height())
+        return QSize(0, self._h)
 
     def _refresh_tooltip(self) -> None:
         if self._explicit_tt is not None:
@@ -331,15 +350,20 @@ class ScrollingLabel(QWidget):
         p = QPainter(self)
         p.setFont(self._font)
         p.setPen(self._color)
+        # Top-aligned in the WHOLE widget: any extra height _line_height() added
+        # is room for descenders below the font's line box. drawText() clips to
+        # its rect, so a rect of just the line box (or of an fm.height()-tall
+        # widget, as before) cut the '_' off; centring would push the line down
+        # into the extra room and cut it off again.
         rect = self.rect()
+        valign = Qt.AlignTop
         if not self._overflows():
-            p.drawText(rect, self._align | Qt.AlignVCenter, self._full)
+            p.drawText(rect, self._align | valign, self._full)
         elif self._hovering:
-            y = self._fm.ascent() + (self.height() - self._fm.height()) // 2
-            p.drawText(-self._offset, y, self._full)
+            p.drawText(-self._offset, self._fm.ascent(), self._full)
         else:
             elided = self._fm.elidedText(self._full, Qt.ElideRight, self._avail())
-            p.drawText(rect, self._align | Qt.AlignVCenter, elided)
+            p.drawText(rect, self._align | valign, elided)
         p.end()
 
 
@@ -1452,6 +1476,7 @@ QLabel#compactReset {{ font-size: 10px; color: {_MUTED}; }}
 QLabel#compactRowTokens {{ font-size: 11px; font-weight: 700; color: {_MUTED}; }}
 QLabel#compactRowDot {{ font-size: 11px; }}
 QLabel#compactRowActivity {{ font-size: 10px; font-weight: 600; letter-spacing: 1px; }}
+QLabel#compactRowSep {{ font-size: 10px; font-weight: 600; color: {_MUTED}; }}
 QLabel#compactRowAgents {{ font-size: 10px; font-weight: 700; color: {_MUTED}; }}
 QScrollArea#compactScroll {{ background: transparent; border: none; }}
 QScrollBar:vertical {{ background: transparent; width: 8px; margin: 2px 0; }}
@@ -1528,7 +1553,11 @@ class CompactRow(QWidget):
         bot.setSpacing(5)
         self.dot = QLabel(self._DOT, objectName="compactRowDot")
         self.activity = QLabel("", objectName="compactRowActivity")
-        self.sep = QLabel("·", objectName="compactRowActivity")
+        # Its own rule with a themed colour: the dot and activity get theirs
+        # per state in update_state(), but nothing ever coloured the "·", so
+        # it fell back to the SYSTEM palette — near-black on a light-mode
+        # desktop (seen on Ubuntu), invisible against the dark row.
+        self.sep = QLabel("·", objectName="compactRowSep")
         self.target = ScrollingLabel(px=10, bold=False, role="muted",
                                      letter_spacing=0, max_w=170, align=Qt.AlignLeft)
         self.agents = QLabel("", objectName="compactRowAgents")
