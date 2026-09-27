@@ -8,7 +8,7 @@ from PySide6.QtCore import QSettings
 
 ORG = "Clawdmeter"
 APP = "Clawdmeter"
-APP_VERSION = "3.0.1"
+APP_VERSION = "3.1.0"
 
 KEY_CRED_PATH = "credentials/path"
 KEY_ALWAYS_ON_TOP = "window/always_on_top"
@@ -25,6 +25,8 @@ KEY_SYSTEM_LIGHT = "ui/system_light"
 KEY_SHOW_MULTIPLE_SESSIONS = "sessions/show_multiple"
 KEY_SHOW_SUBAGENTS = "sessions/show_subagents"
 KEY_SHOW_TOKEN_USAGE = "tokens/show_usage"
+KEY_SCOPED_SEEN = "usage/scoped_seen"
+KEY_SCOPED_SHOWN = "usage/scoped_shown"
 KEY_AUTO_REFRESH = "token/auto_refresh"
 KEY_POLL_INTERVAL = "poll/interval_seconds"
 KEY_IDLE_BACKOFF_ENABLED = "poll/idle_backoff_enabled"
@@ -47,6 +49,7 @@ KEY_RESET_NOTIFY_PUSH_GOTIFY_URL = "notify/reset_push_gotify_url"
 KEY_RESET_NOTIFY_PUSH_GOTIFY_TOKEN = "notify/reset_push_gotify_token"
 KEY_RESET_NOTIFY_PUSH_CHANNELS = "notify/reset_push_channels"
 KEY_APPROACHING_ENABLED = "notify/approaching_enabled"
+KEY_AUTH_NOTIFY = "notify/auth_enabled"
 KEY_APPROACHING_SESSION_PCT = "notify/approaching_session_pct"
 KEY_APPROACHING_WEEKLY_PCT = "notify/approaching_weekly_pct"
 KEY_OVERAGE_ALERT_ENABLED = "notify/overage_alert_enabled"
@@ -269,6 +272,39 @@ def get_show_token_usage() -> bool:
 
 def set_show_token_usage(on: bool) -> None:
     _settings().setValue(KEY_SHOW_TOKEN_USAGE, bool(on))
+
+
+def _get_json_list(key: str) -> list:
+    raw = _settings().value(key, "")
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:   # noqa: BLE001 - a corrupt value must never block startup
+        return []
+    return data if isinstance(data, list) else []
+
+
+def get_scoped_seen() -> list[tuple[str, str]]:
+    """Every scoped usage window the API has reported, as (key, label) in
+    first-seen order — the Settings checkbox list. Remembered so a window that
+    is briefly not reported keeps its checkbox."""
+    return [(str(item[0]), str(item[1])) for item in _get_json_list(KEY_SCOPED_SEEN)
+            if isinstance(item, list) and len(item) == 2]
+
+
+def set_scoped_seen(seen) -> None:
+    _settings().setValue(KEY_SCOPED_SEEN, json.dumps([[k, lbl] for k, lbl in seen]))
+
+
+def get_scoped_shown() -> list[str]:
+    """Keys of the scoped windows the user ticked to show on the dashboard and
+    alert on. Empty by default: a newly reported window is opt-in."""
+    return [str(k) for k in _get_json_list(KEY_SCOPED_SHOWN) if isinstance(k, str)]
+
+
+def set_scoped_shown(keys) -> None:
+    _settings().setValue(KEY_SCOPED_SHOWN, json.dumps(list(dict.fromkeys(keys))))
 
 
 def get_auto_refresh() -> bool:
@@ -510,6 +546,21 @@ def get_approaching_enabled() -> bool:
 
 def set_approaching_enabled(on: bool) -> None:
     _settings().setValue(KEY_APPROACHING_ENABLED, bool(on))
+
+
+def get_auth_notify() -> bool:
+    # Default ON, unlike the approaching alert. That one is a judgement call
+    # about how close is too close; this one means the dashboard has stopped
+    # telling the truth and cannot fix itself — the case for defaulting quiet
+    # is the case for not noticing for a day and a half.
+    v = _settings().value(KEY_AUTH_NOTIFY, True)
+    if isinstance(v, str):
+        return v.lower() in ("true", "1", "yes")
+    return bool(v)
+
+
+def set_auth_notify(on: bool) -> None:
+    _settings().setValue(KEY_AUTH_NOTIFY, bool(on))
 
 
 def _clamp_approaching_pct(value: int) -> int:

@@ -16,6 +16,24 @@ SAFETY (the failsafe):
     backup automatically.
   * The OAuth token endpoint throttles hard (HTTP 429) — callers must back off.
 
+Coexisting with Claude Code (why the desktop app changed things):
+  * In a terminal, the `claude` CLI refreshes the token itself (5 min before
+    expiry) and writes it back to this same file, so while you use the CLI the
+    file is almost always fresh and Clawdmeter rarely has to refresh anything.
+  * The Claude desktop app keeps its own login and hands Claude Code the token
+    directly, so the CLI never touches the file. It goes stale after ~8h and
+    Clawdmeter becomes the only thing refreshing it -- which is when the gaps
+    showed up.
+  * So refresh like the CLI does: early (REFRESH_LEAD_SECONDS), against the
+    current token endpoint, with the stored scopes, and under the CLI's own
+    refresh lock (`~/.claude/.oauth_refresh.lock`). Refresh tokens rotate on
+    use; two processes spending the same one at once leaves one of them with a
+    dead token, so after taking the lock we re-read the file and stand down if
+    someone else already refreshed it.
+  * A refresh token the endpoint rejects (400/401) comes back as REJECTED, and
+    the poller stops retrying until new credentials appear (see
+    UsagePoller._reauth_needed).
+
 Limitation: revert restores the *file*. A refresh that already succeeded has
 rotated the token server-side, so revert protects file integrity, not the
 server rotation. The backup + `claude /login` remain the ultimate recovery.
@@ -27,18 +45,64 @@ import json
 import os
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
+import app_settings
 import macos_keychain
 
-OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+# Current Claude Code token endpoint first; the legacy console host is only a
+# fallback for when the first can't be reached or doesn't route the request.
+OAUTH_TOKEN_URLS = (
+    "https://platform.claude.com/v1/oauth/token",
+    "https://console.anthropic.com/v1/oauth/token",
+)
+OAUTH_TOKEN_URL = OAUTH_TOKEN_URLS[0]
 # Public Claude Code OAuth client id (the same value Claude Code itself uses).
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-REFRESH_HEADERS = {"Content-Type": "application/json", "User-Agent": "anthropic"}
+# Identify as Clawdmeter. The endpoint answers the exact string "anthropic"
+# with HTTP 429 on every request, whatever the token, while any other
+# User-Agent reaches the real token check (measured 2026-09-24: "anthropic"
+# 429, "Anthropic" / "Clawdmeter/3.1.0" / httpx's default 400 on a fake
+# token). So that value never refreshed anything. Same string the update
+# check sends.
+REFRESH_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": f"Clawdmeter/{app_settings.APP_VERSION}",
+}
 
 EXPIRY_SKEW_SECONDS = 120  # treat the token as expired this many seconds early
+# How far AHEAD of expiry the poller refreshes. Deliberately much larger than
+# the skew above: that one answers "is it broken now", this one answers "renew
+# it while we still can". 30 minutes leaves room for a throttled endpoint to
+# be retried several times before anything the user can see breaks.
+REFRESH_LEAD_SECONDS = 1800
 BACKUP_SUFFIX = ".clawdmeter-bak"
+
+# Claude Code's refresh lock (a proper-lockfile directory lock) inside the
+# credentials directory, plus the legacy `<dir>.lock` older CLIs used. A lock
+# whose mtime is older than LOCK_STALE_SECONDS belongs to a dead holder.
+LOCK_NAME = ".oauth_refresh.lock"
+LOCK_STALE_SECONDS = 60
+
+
+class RefreshOutcome(str, Enum):
+    """WHY a refresh ended the way it did — the bare ok/not-ok is not enough.
+
+    The distinction that matters is THROTTLED vs REJECTED. Both look like "the
+    refresh failed", but only one can ever succeed on a retry: a rejected
+    refresh token is dead, and retrying it forever both never works and keeps
+    feeding the endpoint's rate limiter. Callers key their backoff off this.
+    """
+
+    REFRESHED = "refreshed"
+    THROTTLED = "throttled"      # 429 — the endpoint is rate-limiting us
+    REJECTED = "rejected"        # 400/401 — the refresh token itself is dead
+    UNREACHABLE = "unreachable"  # transport: timeout, DNS, connection refused
+    BUSY = "busy"                # Claude Code holds the refresh lock right now
+    ERROR = "error"              # anything else, including local file problems
 
 
 @dataclass
@@ -48,6 +112,8 @@ class RefreshResult:
     http_status: int | None = None
     new_expiry_ms: int | None = None
     reverted: bool = False
+    # Last so every existing positional construction still works.
+    outcome: RefreshOutcome = RefreshOutcome.ERROR
 
 
 def _oauth_block(data: dict) -> dict | None:
@@ -60,6 +126,21 @@ def _oauth_block(data: dict) -> dict | None:
         if isinstance(v, dict) and isinstance(v.get("refreshToken"), str):
             return v
     return None
+
+
+def auto_refresh_supported() -> bool:
+    """Can this install refresh its own token at all?
+
+    False on macOS, where the token lives in the login Keychain and writing the
+    rotated token back there is not implemented. EVERYTHING downstream of a
+    refresh is inert in that case — the lead window, the backoff ceilings, the
+    blocked state — so an expired token there must not be presented as one that
+    a refresh is about to fix. Only signing in again ever clears it.
+
+    One definition, called by the poller for both the "should I try" gate and
+    the "what do I call this failure" decision, so the two cannot drift.
+    """
+    return not _macos_keychain_active()
 
 
 def _macos_keychain_active() -> bool:
@@ -109,11 +190,59 @@ def token_expiry_ms(path: Path, *, blocking: bool = True) -> int | None:
     return None
 
 
-def is_expired(path: Path, skew_seconds: int = EXPIRY_SKEW_SECONDS) -> bool:
-    exp = token_expiry_ms(path)
+def _seconds_until_expiry(path: Path, *, now: float | None = None,
+                          blocking: bool = True) -> float | None:
+    """Seconds left on the stored token, or None when the expiry is unknown.
+
+    ``now`` is injectable so boundary tests can pin the clock. Reading the clock
+    twice around a comparison is how a test that sits exactly on the boundary
+    fails one run in twenty-five.
+
+    ``blocking`` is passed straight through to token_expiry_ms, so a UI-thread
+    caller can refuse to wait on the macOS Keychain. See is_expired().
+    """
+    exp = token_expiry_ms(path, blocking=blocking)
     if exp is None:
+        return None
+    return exp / 1000.0 - (time.time() if now is None else now)
+
+
+def is_expired(path: Path, skew_seconds: int = EXPIRY_SKEW_SECONDS,
+               *, now: float | None = None, blocking: bool = True) -> bool:
+    """Is the token dead RIGHT NOW (within a small skew)?
+
+    This answers the Settings question — "is the thing currently broken" — and
+    must not be widened, or the panel starts calling a healthy token expired.
+    The poller asks a different question; see needs_refresh().
+
+    Pass ``blocking=False`` from the UI thread. The macOS Keychain read this
+    reaches can hang indefinitely on an authorisation dialog, and this function
+    is called while SettingsPanel is being constructed — the case that once hung
+    the app before it drew anything. Non-blocking returns None until the poller
+    has cached a read on its worker, which reads here as "not expired": the
+    conservative answer, since it only leaves a remedy button disabled for a
+    moment rather than offering one for a token that is fine.
+    """
+    left = _seconds_until_expiry(path, now=now, blocking=blocking)
+    if left is None:
         return False  # unknown expiry -> don't trigger a refresh
-    return time.time() * 1000 >= (exp - skew_seconds * 1000)
+    return left <= skew_seconds
+
+
+def needs_refresh(path: Path, lead_seconds: int = REFRESH_LEAD_SECONDS,
+                  *, now: float | None = None) -> bool:
+    """Should the poller refresh YET? True well BEFORE the token dies.
+
+    Refreshing only once the token had already expired left a window where
+    every poll 401'd and recovery depended on the token endpoint answering
+    right then — an endpoint that throttles hard. Refreshing early costs
+    nothing extra: it is the same one refresh per token lifetime, just taken
+    while there is still a working token to fall back on.
+    """
+    left = _seconds_until_expiry(path, now=now)
+    if left is None:
+        return False
+    return left <= lead_seconds
 
 
 def _backup_path(path: Path) -> Path:
@@ -161,11 +290,103 @@ def _write_tokens_safely(path: Path, original_raw: str, data: dict,
         backup.unlink()
     except OSError:
         pass
-    return RefreshResult(True, "Token refreshed", 200)
+    return RefreshResult(True, "Token refreshed", 200,
+                         outcome=RefreshOutcome.REFRESHED)
 
 
-def refresh(path: Path, *, timeout: float = 20.0) -> RefreshResult:
-    """Refresh the access token in `path`. Safe: backs up + reverts on failure."""
+def _lock_paths(cred_dir: Path) -> tuple[Path, Path]:
+    try:
+        legacy = Path(os.path.realpath(cred_dir))
+    except OSError:
+        legacy = cred_dir
+    return cred_dir / LOCK_NAME, Path(str(legacy) + ".lock")
+
+
+def _take_dir_lock(lock: Path) -> bool:
+    """mkdir-based lock, compatible with proper-lockfile. False if held."""
+    for _ in range(2):
+        try:
+            os.mkdir(lock)
+            return True
+        except FileExistsError:
+            try:
+                age = time.time() - os.stat(lock).st_mtime
+            except OSError:
+                continue            # vanished between mkdir and stat -> retry
+            if age < LOCK_STALE_SECONDS:
+                return False
+            try:                    # stale: holder died, take it over
+                os.rmdir(lock)
+            except OSError:
+                return False
+    return False
+
+
+@contextmanager
+def refresh_lock(cred_dir: Path):
+    """Hold Claude Code's refresh lock. Yields False if another process has it.
+
+    The primary lock is required (an unwritable directory raises OSError); the
+    legacy one is best-effort, as it is for the CLI.
+    """
+    primary, legacy = _lock_paths(cred_dir)
+    if not _take_dir_lock(primary):
+        yield False
+        return
+    try:
+        have_legacy = _take_dir_lock(legacy)
+        legacy_busy = not have_legacy and legacy.is_dir()
+    except OSError:
+        have_legacy = legacy_busy = False
+    try:
+        yield not legacy_busy       # an older CLI may be mid-refresh
+    finally:
+        for lock, held in ((legacy, have_legacy), (primary, True)):
+            if held:
+                try:
+                    os.rmdir(lock)
+                except OSError:
+                    pass
+
+
+def _invalid_grant(resp) -> bool:
+    """Is this token-endpoint error OAuth's ``invalid_grant`` — the refresh
+    token itself is dead — rather than a request the server couldn't use?"""
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get("error") == "invalid_grant"
+
+
+def _post_refresh(http, body: dict):
+    """POST to the token endpoint, falling back to the legacy host only when the
+    current one is unreachable or doesn't route the request."""
+    import httpx
+
+    last_exc: Exception | None = None
+    for i, url in enumerate(OAUTH_TOKEN_URLS):
+        last = i == len(OAUTH_TOKEN_URLS) - 1
+        try:
+            resp = http.post(url, headers=REFRESH_HEADERS, json=body)
+        except httpx.HTTPError as exc:
+            last_exc = exc
+            continue
+        if not last and (resp.status_code in (404, 405) or 300 <= resp.status_code < 400):
+            continue
+        return resp
+    raise last_exc if last_exc else httpx.HTTPError("no token endpoint reachable")
+
+
+def refresh(path: Path, *, timeout: float = 20.0,
+            seen_access: str | None = None) -> RefreshResult:
+    """Refresh the access token in `path`. Safe: backs up + reverts on failure.
+
+    ``seen_access`` is the access token the caller decided was stale (default:
+    whatever the file holds on entry). If the file holds a different one by the
+    time we have Claude Code's refresh lock, someone else already refreshed and
+    spending the refresh token again would only kill theirs.
+    """
     # macOS: the token lives in the login Keychain and writing the rotated token
     # back there isn't implemented yet (deliberate — a Keychain write mutates the
     # user's real Claude Code auth). Re-authenticating in Claude Code updates the
@@ -180,6 +401,31 @@ def refresh(path: Path, *, timeout: float = 20.0) -> RefreshResult:
             None,
         )
     try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return RefreshResult(False, f"Cannot read credentials: {exc}")
+    if seen_access is None:
+        try:
+            seen_access = (_oauth_block(json.loads(raw)) or {}).get("accessToken")
+        except json.JSONDecodeError:
+            pass
+
+    try:
+        with refresh_lock(path.parent) as held:
+            if not held:
+                return RefreshResult(
+                    False, "Claude Code is refreshing the token — will re-check shortly",
+                    outcome=RefreshOutcome.BUSY)
+            return _refresh_locked(path, timeout=timeout, seen_access=seen_access)
+    except OSError as exc:
+        return RefreshResult(False, f"Cannot take the refresh lock: {exc}")
+
+
+def _refresh_locked(path: Path, *, timeout: float,
+                    seen_access: str | None) -> RefreshResult:
+    # Re-read under the lock: Claude Code may have rotated the tokens while we
+    # waited, and spending the old refresh token now would kill one of them.
+    try:
         original_raw = path.read_text(encoding="utf-8")
         data = json.loads(original_raw)
     except (OSError, json.JSONDecodeError) as exc:
@@ -187,7 +433,14 @@ def refresh(path: Path, *, timeout: float = 20.0) -> RefreshResult:
 
     blk = _oauth_block(data)
     if not blk or not isinstance(blk.get("refreshToken"), str):
-        return RefreshResult(False, "No refresh token found in credentials")
+        # Nothing to refresh WITH. Only signing in again produces one, so this
+        # is the same dead end as a server-side rejection, not a retryable slip.
+        return RefreshResult(False, "No refresh token found in credentials",
+                             outcome=RefreshOutcome.REJECTED)
+    if seen_access is not None and blk.get("accessToken") != seen_access:
+        return RefreshResult(True, "Token already refreshed by Claude Code",
+                             new_expiry_ms=blk.get("expiresAt"),
+                             outcome=RefreshOutcome.REFRESHED)
     refresh_tok = blk["refreshToken"]
 
     # httpx imported lazily so this module stays importable/testable without it.
@@ -196,20 +449,41 @@ def refresh(path: Path, *, timeout: float = 20.0) -> RefreshResult:
     body = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_tok,
-        "client_id": CLIENT_ID,
+        "client_id": blk.get("clientId") if isinstance(blk.get("clientId"), str) else CLIENT_ID,
     }
+    scopes = blk.get("scopes")
+    if isinstance(scopes, list) and scopes and all(isinstance(x, str) for x in scopes):
+        body["scope"] = " ".join(scopes)
     try:
         with httpx.Client(timeout=timeout) as http:
-            resp = http.post(OAUTH_TOKEN_URL, headers=REFRESH_HEADERS, json=body)
+            resp = _post_refresh(http, body)
     except httpx.HTTPError as exc:
-        return RefreshResult(False, f"Refresh request failed: {exc}")
+        return RefreshResult(False, f"Refresh request failed: {exc}",
+                             outcome=RefreshOutcome.UNREACHABLE)
 
     if resp.status_code == 429:
-        return RefreshResult(False, "Rate limited by token endpoint — backing off", 429)
+        return RefreshResult(False, "Rate limited by token endpoint — backing off", 429,
+                             outcome=RefreshOutcome.THROTTLED)
+    if resp.status_code == 401 or (resp.status_code == 400 and _invalid_grant(resp)):
+        # The server read the refresh token and refused it: expired, or already
+        # rotated by whoever refreshed last. No amount of retrying fixes that.
+        #
+        # A 400 counts only with OAuth's `invalid_grant`. The endpoint answers
+        # a request it can't parse with a 400 too, under a different body
+        # (measured 2026-09-27: a fake refresh token -> 400 {"error":
+        # "invalid_grant"}; no grant_type -> 400 {"type": "error", "error":
+        # {"type": "invalid_request_error"}}). Treating every 400 as a dead
+        # token would, after an endpoint change, stop refreshing for everyone
+        # and tell them to sign in — which would not fix it. That one falls
+        # through to ERROR below and keeps retrying with backoff.
+        return RefreshResult(
+            False, f"Refresh token rejected (HTTP {resp.status_code}) — sign in again",
+            resp.status_code, outcome=RefreshOutcome.REJECTED,
+        )
     if resp.status_code != 200:
         return RefreshResult(
-            False, f"Refresh rejected (HTTP {resp.status_code}) — re-login may be needed",
-            resp.status_code,
+            False, f"Refresh failed (HTTP {resp.status_code})",
+            resp.status_code, outcome=RefreshOutcome.ERROR,
         )
 
     try:
@@ -223,6 +497,8 @@ def refresh(path: Path, *, timeout: float = 20.0) -> RefreshResult:
     blk["refreshToken"] = tok.get("refresh_token") or refresh_tok
     new_expiry_ms = int(time.time() * 1000) + expires_in * 1000
     blk["expiresAt"] = new_expiry_ms
+    if isinstance(tok.get("scope"), str) and tok["scope"].strip():
+        blk["scopes"] = tok["scope"].split()
 
     result = _write_tokens_safely(path, original_raw, data, new_access)
     if result.ok:

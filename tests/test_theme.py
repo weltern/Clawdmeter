@@ -1,11 +1,14 @@
 """Unit tests for the central colour palette + stylesheet builder (theme.py).
 
 Guards the Phase-1 theming invariant that matters most: the default palette
-reproduces the app's historical hardcoded stylesheet byte-for-byte, so wiring
-build_qss() in is a provable no-op. Also checks that a non-default palette
-actually swaps colours, and that the single-pass swap can't alias.
+reproduces the app's historical hardcoded stylesheet byte-for-byte, so the
+colour-swap step (_swap_hexes) is a provable no-op. build_qss() adds only the
+arrow image paths on top (tests/test_qss_arrows.py). Also checks that a
+non-default palette actually swaps colours, and that the single-pass swap
+can't alias.
 
-No Qt needed — theme.py is pure Python. Run with `python -m pytest tests/ -q`.
+No QApplication needed — build_qss() draws the arrow images with QtGui only,
+which works without one. Run with `python -m pytest tests/ -q`.
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ from theme import MIDNIGHT_SALMON, Palette, build_qss  # noqa: E402
 
 def test_default_palette_reproduces_base_qss_exactly():
     # The default theme swaps every hex for itself -> byte-identical output.
-    assert build_qss(MIDNIGHT_SALMON) == theme._BASE_QSS
+    assert theme._swap_hexes(MIDNIGHT_SALMON) == theme._BASE_QSS
 
 
 def test_default_output_carries_the_shipped_colours():
@@ -49,6 +52,19 @@ def test_a_changed_role_actually_swaps_in_the_output():
     assert "#123456" in qss
     # Every base-background occurrence became the new colour.
     assert "#0e1116" not in qss
+
+
+def test_tooltip_is_themed_and_follows_the_palette():
+    # Tooltips (mascot hover, long-title reveal, stats-graph hover) must follow
+    # the theme, not the pale system default. The rule is present, and its
+    # colours swap with the palette's surface / text / border roles.
+    assert "QToolTip {" in build_qss(MIDNIGHT_SALMON)
+    custom = MIDNIGHT_SALMON.with_overrides(
+        surface="#111111", text="#eeeeee", border="#333333")
+    block = build_qss(custom).split("QToolTip {", 1)[1].split("}", 1)[0]
+    assert "background-color: #111111;" in block   # surface role
+    assert "color: #eeeeee;" in block              # text role
+    assert "border: 1px solid #333333;" in block   # border role
 
 
 def test_swap_is_single_pass_no_aliasing():

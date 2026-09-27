@@ -174,6 +174,76 @@ def test_the_mascot_is_never_drawn_below_the_legibility_floor():
         host.deleteLater()
 
 
+# --- horizontal scroll (mascots hold their size; the row scrolls) ------------
+
+def _narrow_shelf(n, w=460, h=320):
+    """A shelf in a dashboard-width host, so a crowded row actually overflows
+    (the default _shelf host is 900px wide and rarely needs to scroll)."""
+    host = QWidget()
+    lay = QVBoxLayout(host)
+    lay.setContentsMargins(0, 0, 0, 0)
+    shelf = SessionShelf()
+    lay.addWidget(shelf, 1)
+    host.resize(w, h)
+    host.show()
+    shelf.set_sessions([_state(f"s{i}", f"proj-{i}") for i in range(n)])
+    QTest.qWait(600)
+    return host, shelf
+
+
+def test_a_crowded_row_scrolls_instead_of_shrinking_the_mascots():
+    # The reason for the rework: past a few sessions the row must scroll
+    # horizontally with the mascots kept at a readable size — not squeeze every
+    # mascot thinner (and eventually hide them) to cram everything into view.
+    host, shelf = _narrow_shelf(n=6, w=460, h=320)
+    try:
+        edges = _edges(shelf)
+        assert len(set(edges)) == 1, f"uneven mascots: {edges}"
+        # Comfortably readable, NOT scraping the legibility floor: the old
+        # viewport//count sizing drew these at ~68px (barely above MIN_MASCOT)
+        # before the row would scroll. Held at their height-driven size they are
+        # far larger — so require well above the floor, which the old code fails.
+        assert edges[0] > 2 * SessionShelf.MIN_MASCOT, (
+            f"mascots were squeezed down to {edges[0]}px instead of scrolling")
+        assert all(t.sprite.isVisible() for t in shelf._tiles.values())
+        sb = shelf._scroll.horizontalScrollBar()
+        assert sb.isVisible() and sb.maximum() > 0, "row did not become scrollable"
+        assert shelf._row_widget.width() > shelf._scroll.viewport().width(), (
+            "the row is not actually wider than the viewport")
+    finally:
+        host.deleteLater()
+
+
+def test_mascot_size_does_not_depend_on_the_session_count():
+    # Height-driven, not count-driven: at a fixed window size, 2 sessions and 8
+    # sessions render the SAME mascot — the extra ones scroll off, they don't
+    # shrink the row.
+    two_host, two = _narrow_shelf(n=2, w=460, h=320)
+    eight_host, eight = _narrow_shelf(n=8, w=460, h=320)
+    try:
+        assert _edges(two)[0] == _edges(eight)[0], (
+            f"the count changed the size: {_edges(two)[0]} vs {_edges(eight)[0]}")
+    finally:
+        two_host.deleteLater()
+        eight_host.deleteLater()
+
+
+def test_the_size_is_stable_while_the_row_scrolls():
+    # The horizontal scrollbar eats ~8px of viewport height; if the mascot size
+    # were read from the live viewport it would shrink, un-summon the bar, grow,
+    # and oscillate forever. Re-running the layout while scrolling is a no-op.
+    host, shelf = _narrow_shelf(n=5, w=460, h=300)
+    try:
+        assert shelf._scroll.horizontalScrollBar().isVisible(), "expected a scroll"
+        first = _edges(shelf)
+        for _ in range(6):
+            shelf._layout_tiles()
+        assert _edges(shelf) == first, (
+            f"unstable while scrolling: {first} -> {_edges(shelf)}")
+    finally:
+        host.deleteLater()
+
+
 # --- what survives -----------------------------------------------------------
 
 def test_the_text_rows_always_survive():

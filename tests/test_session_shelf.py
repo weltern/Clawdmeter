@@ -187,34 +187,46 @@ def test_tiles_reorder_to_match_newest_first():
     shelf.stop_all()
 
 
-def test_existing_tile_sprite_resizes_with_count():
-    # Regression: a survivor tile's mascot must re-scale when the count (and so
-    # the target size) changes — not just the QLabel box, the rendered pixmap.
-    # The resize is animated, so settle each step before asserting the result.
+def test_survivor_mascot_holds_its_size_when_the_count_grows():
+    # Regression (the horizontal-scroll rework): adding sessions must NOT shrink
+    # the existing mascots. Every mascot keeps its height-driven, COUNT-
+    # INDEPENDENT size and the row scrolls sideways instead — the exact opposite
+    # of the old viewport//count sizing, which squeezed every mascot thinner
+    # with each new session (unreadable past ~4, gone past ~7). Needs real
+    # geometry, so the shelf lives in a sized host.
+    from PySide6.QtWidgets import QVBoxLayout, QWidget
+    host = QWidget()
+    lay = QVBoxLayout(host)
+    lay.setContentsMargins(0, 0, 0, 0)
     shelf = SessionShelf()
-    shelf.show()
+    lay.addWidget(shelf, 1)
+    host.resize(460, 320)
+    host.show()
+
     shelf.set_sessions([_state("a", Activity.CODING)])
     QTest.qWait(SETTLE_MS)
-    tile_a = shelf._tiles["a"]
-    assert tile_a.sprite._size == 200          # solo -> 200
+    solo = shelf._tiles["a"].sprite._render_size()
+    assert solo > 0
 
     shelf.set_sessions([
-        _state("a", Activity.CODING),
-        _state("b", Activity.THINKING),
-        _state("c", Activity.READING),
+        _state("a", Activity.CODING), _state("b", Activity.THINKING),
+        _state("c", Activity.READING), _state("d", Activity.PLANNING),
+        _state("e", Activity.SEARCHING),
     ])
     QTest.qWait(SETTLE_MS)
-    assert tile_a.sprite._size == 130          # 3 sessions -> 130, survivor re-scaled
-    # maximumWidth is no longer pinned: the shelf mascot is scale-to-fit, so the
-    # count sets its PREFERRED size and the layout decides the real one. Pinning
-    # it was what let the mascots drive the window's height.
-    assert tile_a.sprite._scale_to_fit
-    assert tile_a.sprite.sizeHint().width() == 130
+    sizes = [t.sprite._render_size() for t in shelf._tiles.values()]
+    assert len(set(sizes)) == 1, f"mascots came out uneven: {sizes}"
+    # The mascots did not shrink — five sessions render at the same size one did.
+    assert sizes[0] >= solo, f"5 sessions shrank the mascot: {solo} -> {sizes[0]}"
+    # …and because they held their size, the row overflows and scrolls.
+    assert shelf._scroll.horizontalScrollBar().isVisible()
 
+    # Drop back to one: still fine, still the same size.
     shelf.set_sessions([_state("a", Activity.CODING)])
     QTest.qWait(SETTLE_MS)
-    assert tile_a.sprite._size == 200          # back to solo -> re-grown
+    assert shelf._tiles["a"].sprite._render_size() == solo
     shelf.stop_all()
+    host.deleteLater()
 
 
 def test_enter_starts_collapsed_and_leave_defers_removal():

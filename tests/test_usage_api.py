@@ -54,7 +54,7 @@ def test_full_response():
     assert f["extra_usage_enabled"] is True
     assert f["extra_usage_used_usd"] == 17.93     # amount_minor 1793 / 10**2 — NOT 1793
     assert f["extra_usage_limit_usd"] is None      # uncapped
-    assert f["model_windows"] == {"Sonnet": 12}
+    assert [(w.label, w.pct) for w in f["scoped_windows"]] == [("Weekly · Sonnet", 12)]
 
 
 def test_empty_and_none_are_safe():
@@ -64,7 +64,8 @@ def test_empty_and_none_are_safe():
         assert f["extra_usage_enabled"] is False
         assert f["extra_usage_used_usd"] == 0.0
         assert f["extra_usage_limit_usd"] is None
-        assert f["model_windows"] == {}
+        # A parsed response with no limits is "none", not "unknown" (None).
+        assert f["scoped_windows"] == []
 
 
 def test_missing_spend_defaults_to_zero():
@@ -93,7 +94,8 @@ def test_model_window_skips_unscoped_and_nonnumeric():
         {"percent": None, "scope": {"model": {"display_name": "Opus"}}},
         {"percent": 7, "scope": {"model": {"display_name": "Haiku"}}},
     ]}
-    assert usage_fields_from_json(usage, {})["model_windows"] == {"Haiku": 7}
+    windows = usage_fields_from_json(usage, {})["scoped_windows"]
+    assert [(w.name, w.pct) for w in windows] == [("Haiku", 7)]
 
 
 if __name__ == "__main__":

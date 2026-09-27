@@ -49,7 +49,7 @@ class _Clock:
     def expiry_ms(self, _path, **_kw):
         return (time.time() + self.secs_left) * 1000
 
-    def expired(self, _path):
+    def expired(self, _path, **_kw):
         return self.secs_left <= 0
 
 

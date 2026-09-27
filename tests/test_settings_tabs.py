@@ -99,9 +99,10 @@ def test_approaching_threshold_box_follows_its_master():
 
 def test_shared_channels_show_for_any_alert_and_hide_when_all_off():
     sp = _panel()
-    # Reset on, approaching off -> channels shown.
+    # Reset on, the others off -> channels shown.
     _set_silently(sp.notify_check, True)
     _set_silently(sp.approaching_check, False)
+    _set_silently(sp.auth_notify_check, False)
     sp._sync_notify_subtoggles()
     assert not sp.notify_how_box.isHidden()
     # Only approaching on -> still shown (channels are shared).
@@ -109,8 +110,14 @@ def test_shared_channels_show_for_any_alert_and_hide_when_all_off():
     _set_silently(sp.approaching_check, True)
     sp._sync_notify_subtoggles()
     assert not sp.notify_how_box.isHidden()
-    # Everything off -> channels hidden as a unit.
+    # Only the auth alert on -> still shown. It delivers through these same
+    # channels, so hiding them left it firing through controls nobody could see.
     _set_silently(sp.approaching_check, False)
+    _set_silently(sp.auth_notify_check, True)
+    sp._sync_notify_subtoggles()
+    assert not sp.notify_how_box.isHidden()
+    # Everything off -> channels hidden as a unit.
+    _set_silently(sp.auth_notify_check, False)
     sp._sync_notify_subtoggles()
     assert sp.notify_how_box.isHidden()
 
@@ -136,3 +143,86 @@ if __name__ == "__main__":
         fn()
         print(f"ok  {fn.__name__}")
     print(f"\n{len(fns)} passed")
+
+
+def test_ticking_the_auth_alert_reveals_the_delivery_channels(monkeypatch):
+    """Drives the REAL toggled signal, not _set_silently.
+
+    The handler is what has to call _sync_notify_subtoggles; a test that calls
+    the sync itself would pass with the handler's call deleted. The setter is
+    swapped for a no-op so driving the widget never writes into HKCU.
+    """
+    import app_settings
+    monkeypatch.setattr(app_settings, "set_auth_notify", lambda *_a: None)
+    monkeypatch.setattr(app_settings, "set_approaching_enabled", lambda *_a: None)
+    monkeypatch.setattr(app_settings, "set_reset_notify", lambda *_a: None)
+
+    sp = _panel()
+    _set_silently(sp.notify_check, False)
+    _set_silently(sp.approaching_check, False)
+    _set_silently(sp.auth_notify_check, False)
+    sp._sync_notify_subtoggles()
+    assert sp.notify_how_box.isHidden(), "control: hidden with every alert off"
+
+    sp.auth_notify_check.setChecked(True)      # real signal -> real handler
+
+    assert not sp.notify_how_box.isHidden()
+
+
+def test_the_panel_never_blocks_on_a_credential_read(monkeypatch):
+    """Built on the UI thread, so the macOS Keychain read must not be waited on.
+
+    This call sat eleven lines under a comment explaining exactly that, and
+    blocked anyway.
+    """
+    import token_refresh
+    seen = []
+    monkeypatch.setattr(token_refresh, "token_expiry_ms", lambda _p, **kw: None)
+    real = token_refresh.is_expired
+    monkeypatch.setattr(token_refresh, "is_expired",
+                        lambda p, *a, **kw: (seen.append(kw.get("blocking", True)),
+                                             real(p, *a, **kw))[1])
+    monkeypatch.setattr(token_refresh, "_macos_keychain_active", lambda: False)
+
+    _panel()
+
+    assert seen, "control: is_expired was never called, so this proves nothing"
+    assert all(b is False for b in seen), f"blocking read on the UI thread: {seen}"
+
+
+def _on_sample_calls() -> set:
+    """Attribute-call names inside Dashboard._on_sample, via the AST.
+
+    An AST walk rather than a substring search: it sees a real call, ignores
+    comments and docstrings, and survives the line being re-wrapped. Matching
+    source text would pass on a mention in a comment and fail on a reflow.
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parents[1] / "src" / "dashboard.py"
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    cls = next(n for n in ast.walk(tree)
+               if isinstance(n, ast.ClassDef) and n.name == "Dashboard")
+    fn = next(n for n in cls.body
+              if isinstance(n, ast.FunctionDef) and n.name == "_on_sample")
+    return {n.func.attr for n in ast.walk(fn)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+
+
+def test_the_ast_probe_can_see_a_call_that_is_definitely_there():
+    """Control. A broken walk and a missing call look identical without this."""
+    calls = _on_sample_calls()
+
+    assert "_apply_status_badge" in calls
+    assert "definitely_not_a_real_method" not in calls
+
+
+def test_the_poller_verdict_is_handed_to_settings():
+    """Otherwise the Connection tab renders a state it is never told about.
+
+    The wording branch has its own test in test_platform_wording, but that
+    passes with this call deleted — the panel would simply never learn the
+    refresh had been blocked, and would go on offering to wait for one.
+    """
+    assert "set_reauth_needed" in _on_sample_calls()

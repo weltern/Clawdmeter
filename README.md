@@ -12,6 +12,8 @@ Standalone desktop dashboard for Claude Code usage — **Windows, macOS and Linu
 - **Session (5h) %** with reset countdown
 - **Weekly (7d) %** with reset countdown — and a red **overage** state on either
   bar when it climbs past 100% onto usage credits
+- **Additional limits** your plan has, such as a weekly limit on one model
+  (`Weekly · Fable`), as extra bars when you turn them on in Settings
 - **Token usage** for each window (input+output), inline beside the bars and
   broken down per session
 - A **session shelf** — one Clawd mascot per active Claude Code session, each
@@ -141,8 +143,9 @@ A plan badge (e.g. `Max 5× · $100/mo`) sits at the top, and below it:
 - **When you work** — a 7×24 weekday-by-hour heatmap of your activity.
 - a **this-month recap** — top model, busiest day, biggest day ever, and totals.
 - **Usage windows** — the **per-model** rate-limit windows the API reports (e.g.
-  `Weekly · Opus`), kept at the very bottom. The overall 5h/7d windows aren't
-  repeated here; they live on the Dashboard.
+  `Weekly · Fable`), kept at the very bottom. The overall 5h/7d windows aren't
+  repeated here; they live on the Dashboard, and you can add any of these there
+  too (**Settings → Display → Additional limits**).
 
 ![Clawdmeter Stats page — the full page: API value and ROI, extra usage, cache savings, time to cap, streak and sessions, value by model and project, code by language, activity mix, this week vs last, value per day, a weekday-by-hour heatmap, a monthly recap and per-model usage windows](assets/Screenshot-stats.png)
 
@@ -246,6 +249,14 @@ six tabs that each scroll on their own. Here's every setting, grouped by tab.
 - **Token usage** — **Show token usage** toggles every token figure (the totals
   beside the bars, the per-session tiles and hover breakdown, and the tray line).
   On by default; read from your local transcripts, never the API.
+- **Additional limits** — one checkbox for each extra limit your account has
+  reported beyond the 5h and 7d windows (e.g. **Weekly · Fable**). A ticked
+  limit gets its own bar, with its reset countdown, in the full, compact and
+  mini views, and the approaching-limit alert covers it too. Past 100% its bar
+  reads **OVER LIMIT**. All off by default. A limit Clawdmeter has seen before
+  but the API isn't reporting right now stays in the list, marked as such.
+  These come from the same usage request the Stats page already makes, so
+  turning them on adds no API calls.
 
 ### Appearance
 
@@ -259,9 +270,19 @@ six tabs that each scroll on their own. Here's every setting, grouped by tab.
   a non-default `.credentials.json`.
 - **Token** — Claude's OAuth access token expires roughly every 8 hours, which
   would otherwise blank the dashboard. With **Auto-refresh when expired** on (the
-  default), the app mints a fresh token automatically so it stays live. The
-  **Refresh token now** button is a manual override, enabled only when the token
-  is actually expired.
+  default), the app renews it about 30 minutes before it expires, so it stays
+  live. The **Refresh token now** button is a manual override, enabled only when
+  the token is actually expired. This matters most if you use Claude Code
+  through the **Claude desktop app**: the desktop app keeps its own login, so
+  unlike the `claude` CLI it never renews `~/.claude/.credentials.json` and
+  Clawdmeter has to. It refreshes the same way the CLI does, under the CLI's own
+  refresh lock, so the two never use up each other's refresh token. If Claude
+  rejects the token or its refresh token, Clawdmeter stops retrying and **Sign
+  in again** opens Claude Code's own sign-in (`claude auth login`) in a
+  terminal; the new token is picked up on the next poll.
+  **On macOS** the token lives in the login Keychain, which Clawdmeter only
+  reads — it can't refresh it there, so the refresh controls are greyed out.
+  When it expires, run `claude` or use **Sign in again**.
 - **Usage polling** — how often the app checks your usage. Each check is a tiny
   billed API request, so the interval is adjustable from **10 to 600 seconds**
   (60 by default): lower is fresher but makes more requests; higher is gentler on
@@ -285,12 +306,22 @@ channels are shared across every alert.
 
   ![Clawdmeter limit-reset notification — "Claude limit reset" over "Session limit has reset — you can resume."](assets/Screenshot-Session-Limit-Reset.png)
 
+- **When usage can't be read (sign-in problem)** *(on by default)* tells you
+  when the token has expired, been rejected, or can't be found — the session
+  mascots keep working without a token, so the 5h/7d bars quietly freezing is
+  otherwise easy to miss. It fires **once** when it happens (and once more if an
+  expiry turns out to need you to sign in again), then once when usage can be
+  read again. A dropped network or an API hiccup doesn't trigger it.
+
 - **When approaching a limit** warns you *before* you run out — pick a separate
   **% threshold for the 5h session and the 7d week** (50–99%; defaults 90% and
   80%, since the weekly window is the scarce one you can't recover quickly). Each
   warning fires **once** when you cross its threshold and re-arms after that
-  window resets, so it never nags every poll. **Also alert when I cross 100% into
-  overage** adds a ping the moment either window tips onto paid usage credits.
+  window resets, so it never nags every poll. **Also alert when a limit passes
+  100%** adds a ping the moment either window tips onto paid usage credits.
+  Any additional limit you've ticked in **Display** is watched too — a weekly
+  one at the 7d threshold — and, with that same box on, gets its own "reached
+  100% of its limit" ping.
   Off by default — flip it on when you want the heads-up.
 
   You choose **where** alerts reach you — pick either channel, or both. **Show a

@@ -25,18 +25,24 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from isotime import parse_iso_ts  # noqa: F401 (also re-exported)
+
 TRANSCRIPTS_DIR = Path.home() / ".claude" / "projects"
 POLL_MS = 500
 STALE_SECONDS = 90
-# A transcript stays on the shelf only while its file was touched this recently.
-# Beyond this window the session is considered finished and its tile vanishes.
-ACTIVE_WINDOW_SECONDS = 600
+# A session stays on the shelf only while its last real ACTIVITY was this
+# recent (see last_activity_ts — measured from the transcript's own events, NOT
+# the file mtime, so a maintenance pass that rewrites a dead transcript can't
+# resurrect it). Beyond this window the session is finished and its tile
+# vanishes. Kept to 5 min so a burst of session-switching doesn't leave a long
+# trail of idle tiles: a session shows active for STALE_SECONDS, dims to IDLE
+# for the remainder, then drops off.
+ACTIVE_WINDOW_SECONDS = 300
 # A subagent shows as a child mascot only while its file was touched this
 # recently; once it goes quiet (the agent finished) its mascot drops off.
 AGENT_ACTIVE_SECONDS = 45
@@ -319,47 +325,6 @@ def project_name_from_cwd(cwd: str | None, transcript_path: Path | None) -> str:
         if parent:
             return parent
     return "unknown"
-
-
-def parse_iso_ts(value: str | None) -> float | None:
-    """Parse a Claude Code event ``timestamp`` (ISO-8601 UTC, e.g.
-    ``"2026-06-14T03:26:31.977Z"``) into an epoch float.
-
-    Returns None when the value is absent or unparseable so callers can fall
-    back to wall-clock time. UTC throughout, so ``time.time() - parse_iso_ts(...)``
-    is the true elapsed seconds regardless of local timezone.
-    """
-    if not isinstance(value, str) or not value:
-        return None
-    txt = value.strip()
-    if txt.endswith("Z"):
-        txt = txt[:-1] + "+00:00"
-
-    def _epoch(s: str) -> float:
-        dt = datetime.fromisoformat(s)
-        # A tz-less timestamp would otherwise be read as LOCAL by .timestamp(),
-        # shifting it by the UTC offset. Claude Code always writes a 'Z', but be
-        # safe: treat a naive value as UTC.
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
-
-    try:
-        return _epoch(txt)
-    except ValueError:
-        pass
-    # Some fromisoformat variants reject odd fractional-second digit counts;
-    # strip the ".<digits>" fraction and retry (tz suffix, if any, is kept).
-    dot = txt.find(".")
-    if dot != -1:
-        end = dot + 1
-        while end < len(txt) and txt[end].isdigit():
-            end += 1
-        try:
-            return _epoch(txt[:dot] + txt[end:])
-        except ValueError:
-            return None
-    return None
 
 
 def session_label(
@@ -705,6 +670,65 @@ def account_tokens_by_model(since_ts: float, root: Path | None = None) -> dict:
         acc["cache_read"] += cr
         acc["cache_write"] += cw
     return out
+
+
+# --- last-activity timestamp (immune to mtime touches) ----------------------
+# The shelf must decide "is this session active" from the last REAL event inside
+# the transcript, not from the file's mtime. A session-maintenance pass can
+# rewrite a long-dead transcript — bumping its mtime WITHOUT adding content —
+# and keying recency off mtime made those dead sessions resurrect onto the
+# shelf (observed: files last active 9-41h ago, rewritten minutes ago, popping
+# back as IDLE tiles). Reading the last event's own timestamp is immune to that.
+#
+# Cache the parsed value by (size, mtime) so an unchanged file is free on the
+# next scan; only a file whose stat actually changed re-reads its tail. Keyed by
+# path — stale entries for deleted files are a handful of harmless tuples.
+_LAST_TS_CACHE: dict[Path, tuple[int, float, float]] = {}
+
+
+def _read_last_event_ts(path: Path, tail_bytes: int = 262144) -> float | None:
+    """Timestamp of the last event line in a transcript, read from its TAIL.
+
+    Transcripts are appended chronologically, so the final timestamped line is
+    the most recent activity; only the last chunk is read so a multi-MB file
+    costs almost nothing. Returns None when the tail carries no parseable
+    timestamp (an empty/partial/rotated file), so the caller can fall back."""
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, 2)                    # SEEK_END
+            fsize = fh.tell()
+            fh.seek(max(0, fsize - tail_bytes))
+            data = fh.read()
+    except OSError:
+        return None
+    ts = None
+    for line in data.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except (ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(ev, dict):
+            t = parse_iso_ts(ev.get("timestamp"))
+            if t is not None:
+                ts = t
+    return ts
+
+
+def last_activity_ts(path: Path, size: int, mtime: float) -> float:
+    """The session's true last-active time: the last event IN the transcript,
+    not the file's mtime. Cached by (size, mtime). Falls back to mtime when the
+    file has no parseable timestamp, so an unreadable file is never hidden."""
+    cached = _LAST_TS_CACHE.get(path)
+    if cached is not None and cached[0] == size and cached[1] == mtime:
+        return cached[2]
+    ts = _read_last_event_ts(path)
+    if ts is None:
+        ts = mtime
+    _LAST_TS_CACHE[path] = (size, mtime, ts)
+    return ts
 
 
 def select_active(
@@ -1086,16 +1110,37 @@ class TranscriptWatcher(QObject):
         self._timer.stop()
 
     def _scan_entries(self) -> list[tuple[Path, float]]:
-        """Gather (path, mtime) for every transcript on disk (the I/O half)."""
+        """Gather (path, recency) for every transcript on disk (the I/O half).
+
+        For a parent SESSION, `recency` is the last real EVENT timestamp — NOT
+        the file mtime — so a maintenance pass that rewrites a dead transcript
+        without adding content can't bump it back onto the shelf. Only files
+        whose mtime is recent enough to matter are read (an old mtime already
+        rules a file out, and mtime is never earlier than the last event), so
+        the tail reads stay confined to the handful of candidate files.
+
+        Subagent transcripts (and the subagents/ bookkeeping tree) keep mtime:
+        they're short-lived and written continuously while the agent works, and
+        group_sessions folds/ignores them anyway.
+        """
         if not TRANSCRIPTS_DIR.exists():
             return []
+        now = time.time()
         entries: list[tuple[Path, float]] = []
         for p in TRANSCRIPTS_DIR.rglob("*.jsonl"):
             try:
-                m = p.stat().st_mtime
+                st = p.stat()
             except OSError:
                 continue
-            entries.append((p, m))
+            m = st.st_mtime
+            if is_subagent_path(p) or now - m > ACTIVE_WINDOW_SECONDS:
+                # Agent/bookkeeping, or a stale mtime that already excludes it —
+                # no need to read content in either case.
+                entries.append((p, m))
+            else:
+                # A shelf candidate: judge it by its real last-event time so a
+                # touched-but-dead transcript is dropped despite its fresh mtime.
+                entries.append((p, last_activity_ts(p, st.st_size, m)))
         return entries
 
     def _rescan(self) -> None:
