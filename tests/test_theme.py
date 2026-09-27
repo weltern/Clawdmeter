@@ -1,11 +1,14 @@
 """Unit tests for the central colour palette + stylesheet builder (theme.py).
 
 Guards the Phase-1 theming invariant that matters most: the default palette
-reproduces the app's historical hardcoded stylesheet byte-for-byte, so wiring
-build_qss() in is a provable no-op. Also checks that a non-default palette
-actually swaps colours, and that the single-pass swap can't alias.
+reproduces the app's historical hardcoded stylesheet byte-for-byte, so the
+colour-swap step (_swap_hexes) is a provable no-op. build_qss() adds only the
+arrow image paths on top (tests/test_qss_arrows.py). Also checks that a
+non-default palette actually swaps colours, and that the single-pass swap
+can't alias.
 
-No Qt needed — theme.py is pure Python. Run with `python -m pytest tests/ -q`.
+No QApplication needed — build_qss() draws the arrow images with QtGui only,
+which works without one. Run with `python -m pytest tests/ -q`.
 """
 
 from __future__ import annotations

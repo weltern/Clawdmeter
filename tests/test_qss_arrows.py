@@ -107,6 +107,19 @@ def test_every_arrow_placeholder_is_resolved():
         assert "{arrow:" not in qss, f"{name}: an arrow placeholder leaked"
 
 
+def test_arrows_are_cached_per_user_not_in_the_shared_temp_dir():
+    # On Linux the temp dir is one /tmp shared by every user: the first user
+    # would own the folder and others could plant symlinks at the write path.
+    import tempfile
+    from PySide6.QtCore import QStandardPaths
+    folder = os.path.normcase(os.path.abspath(theme._arrow_dir()))
+    cache = os.path.normcase(os.path.abspath(QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.GenericCacheLocation)))
+    tmp = os.path.normcase(os.path.abspath(tempfile.gettempdir()))
+    assert os.path.dirname(folder) == cache, folder
+    assert not folder.startswith(tmp + os.sep), folder
+
+
 def test_an_unwritable_cache_drops_the_arrow_instead_of_crashing(monkeypatch):
     def boom(*a, **k):
         raise OSError("read-only")

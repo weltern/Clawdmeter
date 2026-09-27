@@ -959,9 +959,20 @@ _ARROW_W, _ARROW_H = 8, 5      # logical px; the QSS width/height match
 
 
 def _arrow_dir() -> str:
+    """The user's OWN cache folder (~/.cache, ~/Library/Caches,
+    %LOCALAPPDATA%\\cache), never the temp dir: on Linux that is one /tmp
+    shared by every user, where the first user to run the app owns the folder
+    (so nobody else can add a colour), another user could plant a symlink at
+    the predictable write path, and tmp cleaners delete arrows mid-session.
+    The Generic location needs no application name, so it resolves the same
+    before and after QApplication sets one."""
     import os
-    import tempfile
-    return os.path.join(tempfile.gettempdir(), "clawdmeter-qss")
+    from PySide6.QtCore import QStandardPaths
+    base = QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.GenericCacheLocation)
+    if not base:
+        raise OSError("no per-user cache folder")
+    return os.path.join(base, "clawdmeter-qss")
 
 
 def _render_arrow(path: str, direction: str, color: str, scale: int) -> None:
