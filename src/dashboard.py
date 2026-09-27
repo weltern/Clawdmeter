@@ -2527,10 +2527,15 @@ class SettingsPanel(QWidget):
                     "Disabled because your token is still valid — it refreshes "
                     "automatically when it expires."
                 )
-            # Same gate as the refresh button: offered whenever the token is in
-            # trouble, disabled WITH A REASON rather than hidden the rest of the
-            # time, so it can be found before it is needed.
-            self._set_reauth_enabled(needs_refresh, "" if needs_refresh else (
+            # Offered whenever the token is in trouble, disabled WITH A REASON
+            # rather than hidden the rest of the time, so it can be found before
+            # it is needed. "In trouble" includes the poller's verdict, not just
+            # the file's expiry: a revoked token (or a 403) still carries a
+            # future expiresAt, and gating on the expiry alone disabled this
+            # button as "still valid" while the badge and the alert both sent
+            # the user here to sign in again.
+            offer = needs_refresh or self._reauth_needed
+            self._set_reauth_enabled(offer, "" if offer else (
                 "Disabled because your token is still valid. Signing in again "
                 "replaces your Claude Code credentials."
             ))
@@ -2541,6 +2546,19 @@ class SettingsPanel(QWidget):
         # re-entering the Connection tab, or by a refresh actually succeeding --
         # all cases where the stale failure text should go.
         self._token_status_is_transient = False
+        if self._reauth_needed and not token_refresh._macos_keychain_active():
+            # The poller's verdict outranks the file's expiry. It sets this only
+            # when a refresh was REJECTED or the API refused the token outright,
+            # and neither is visible in expiresAt — a revoked token still reads
+            # "valid for hours", which is what this line used to say while
+            # every other surface said "sign in again".
+            if exp is not None and exp / 1000 - time.time() <= 0:
+                self.token_status.setText(
+                    "Token expired and can't be refreshed — use Sign in again above.")
+            else:
+                self.token_status.setText(
+                    "Claude rejected this token — use Sign in again above.")
+            return
         if exp is None:
             self.token_status.setText("Token expiry unknown.")
             return
@@ -2570,14 +2588,7 @@ class SettingsPanel(QWidget):
                 self.token_status.setText(
                     f"Valid for ~{h}h {m}m — read from the login Keychain.")
             return
-        if secs <= 0 and self._reauth_needed:
-            # Auto-refresh has been switched off by a rejected refresh token, so
-            # "wait for auto-refresh" would send the user waiting for something
-            # that is never coming — the same mistake the macOS branch above
-            # exists to avoid. Name the one remedy that can still work.
-            self.token_status.setText(
-                "Token expired and can't be refreshed — use Sign in again above.")
-        elif secs <= 0:
+        if secs <= 0:
             self.token_status.setText("Token expired — refresh now, or wait for auto-refresh.")
         elif needs_refresh:
             self.token_status.setText("Token expiring — refresh now, or wait for auto-refresh.")
