@@ -1473,6 +1473,7 @@ QLabel#compactReset {{ font-size: 10px; color: {_MUTED}; }}
 QLabel#compactRowTokens {{ font-size: 11px; font-weight: 700; color: {_MUTED}; }}
 QLabel#compactRowDot {{ font-size: 11px; }}
 QLabel#compactRowActivity {{ font-size: 10px; font-weight: 600; letter-spacing: 1px; }}
+QLabel#compactRowSep {{ font-size: 10px; font-weight: 600; color: {_MUTED}; }}
 QLabel#compactRowAgents {{ font-size: 10px; font-weight: 700; color: {_MUTED}; }}
 QScrollArea#compactScroll {{ background: transparent; border: none; }}
 QScrollBar:vertical {{ background: transparent; width: 8px; margin: 2px 0; }}
@@ -1549,7 +1550,11 @@ class CompactRow(QWidget):
         bot.setSpacing(5)
         self.dot = QLabel(self._DOT, objectName="compactRowDot")
         self.activity = QLabel("", objectName="compactRowActivity")
-        self.sep = QLabel("·", objectName="compactRowActivity")
+        # Its own rule with a themed colour: the dot and activity get theirs
+        # per state in update_state(), but nothing ever coloured the "·", so
+        # it fell back to the SYSTEM palette — near-black on a light-mode
+        # desktop (seen on Ubuntu), invisible against the dark row.
+        self.sep = QLabel("·", objectName="compactRowSep")
         self.target = ScrollingLabel(px=10, bold=False, role="muted",
                                      letter_spacing=0, max_w=170, align=Qt.AlignLeft)
         self.agents = QLabel("", objectName="compactRowAgents")

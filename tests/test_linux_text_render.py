@@ -69,3 +69,23 @@ def test_label_is_tall_enough_for_the_underscore():
         f"only {got}/{want} underscore pixels visible — the label is "
         f"{label.height()}px tall and clips below its baseline")
 
+
+def test_compact_separator_uses_the_theme_not_the_system_palette():
+    # Simulate a light-mode desktop: system text is black.
+    old = _app.palette()
+    pal = QPalette(old)
+    pal.setColor(QPalette.WindowText, QColor("#000000"))
+    _app.setPalette(pal)
+    try:
+        host = QWidget()
+        host.setStyleSheet(session_shelf.COMPACT_STYLESHEET)
+        QVBoxLayout(host).addWidget(row := session_shelf.CompactRow("s1"))
+        host.show()
+        _app.processEvents()
+        row.sep.ensurePolished()
+        got = row.sep.palette().color(QPalette.WindowText).name().lower()
+        assert got == QColor(session_shelf._MUTED).name().lower(), (
+            f"separator is {got}, not the theme's muted {session_shelf._MUTED}")
+        host.close()
+    finally:
+        _app.setPalette(old)
