@@ -95,15 +95,27 @@ def _patch_refresh_transport(monkeypatch, handler):
     monkeypatch.setattr(real_httpx, "Client", _FakeClient)
 
 
-@pytest.mark.parametrize("code, expected", [
-    (429, Outcome.THROTTLED),
-    (400, Outcome.REJECTED),
-    (401, Outcome.REJECTED),
-    (500, Outcome.ERROR),
+# Bodies as the live endpoint sent them (2026-09-27): a dead refresh token,
+# and a request it could not parse.
+_DEAD_TOKEN = {"error": "invalid_grant",
+               "error_description": "Refresh token not found or invalid"}
+_BAD_REQUEST = {"type": "error", "error": {
+    "type": "invalid_request_error", "message": "Unsupported grant_type: None"}}
+
+
+@pytest.mark.parametrize("code, body, expected", [
+    (429, {}, Outcome.THROTTLED),
+    (400, _DEAD_TOKEN, Outcome.REJECTED),
+    # A 400 the SERVER can't use says nothing about the token: sign-in would
+    # not fix it, so it must stay retryable rather than stop auto-refresh.
+    (400, _BAD_REQUEST, Outcome.ERROR),
+    (400, {}, Outcome.ERROR),
+    (401, {}, Outcome.REJECTED),
+    (500, {}, Outcome.ERROR),
 ])
-def test_refresh_classifies_the_server_answer(tmp_path, monkeypatch, code, expected):
+def test_refresh_classifies_the_server_answer(tmp_path, monkeypatch, code, body, expected):
     path = _creds(tmp_path, int(NOW * 1000))
-    _patch_refresh_transport(monkeypatch, lambda req: httpx.Response(code, json={}))
+    _patch_refresh_transport(monkeypatch, lambda req: httpx.Response(code, json=body))
 
     result = token_refresh.refresh(path)
 
