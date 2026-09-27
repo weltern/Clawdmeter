@@ -6,7 +6,7 @@ colours — now lives in one `Palette`. The main-window QSS and the
 custom-painted widgets (statviz, session_shelf) build their colours from it.
 
 This module is a *faithful* extraction: ``MIDNIGHT_SALMON`` holds the exact
-hexes the app shipped with, and ``build_qss(MIDNIGHT_SALMON)`` reproduces the
+hexes the app shipped with, and ``_swap_hexes(MIDNIGHT_SALMON)`` reproduces the
 old hardcoded stylesheet byte-for-byte, so wiring it in is a provable no-op.
 Presets, light mode and custom themes build on top of this in later phases.
 
@@ -768,18 +768,10 @@ QSpinBox::up-button, QSpinBox::down-button {
 QSpinBox::up-button { subcontrol-position: top right; border-top-right-radius: 6px; }
 QSpinBox::down-button { subcontrol-position: bottom right; border-bottom-right-radius: 6px; }
 QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: #374151; }
-QSpinBox::up-arrow {
-    width: 0; height: 0; image: none;
-    border-left: 4px solid transparent; border-right: 4px solid transparent;
-    border-bottom: 5px solid #9ca3af;
-}
-QSpinBox::down-arrow {
-    width: 0; height: 0; image: none;
-    border-left: 4px solid transparent; border-right: 4px solid transparent;
-    border-top: 5px solid #9ca3af;
-}
-QSpinBox::up-arrow:hover { border-bottom-color: #e6edf3; }
-QSpinBox::down-arrow:hover { border-top-color: #e6edf3; }
+QSpinBox::up-arrow { image: url({arrow:up:text_dim}); width: 8px; height: 5px; }
+QSpinBox::down-arrow { image: url({arrow:down:text_dim}); width: 8px; height: 5px; }
+QSpinBox::up-arrow:hover { image: url({arrow:up:text}); }
+QSpinBox::down-arrow:hover { image: url({arrow:down:text}); }
 
 /* Preset dropdown (Appearance page) — swatch icon + name per item. */
 QComboBox {
@@ -790,9 +782,7 @@ QComboBox:hover { border-color: #4b5563; }
 QComboBox:focus, QComboBox:on { border-color: #CE7D6B; }
 QComboBox::drop-down { border: 0; width: 22px; }
 QComboBox::down-arrow {
-    image: none; width: 0; height: 0; margin-right: 8px;
-    border-left: 4px solid transparent; border-right: 4px solid transparent;
-    border-top: 5px solid #9ca3af;
+    image: url({arrow:down:text_dim}); width: 8px; height: 5px; margin-right: 8px;
 }
 QComboBox QAbstractItemView {
     background-color: #161b22; color: #e6edf3;
@@ -958,12 +948,81 @@ QPushButton#applyBtn:hover { background-color: #d98f7e; border-color: #d98f7e; }
 """
 
 
-def build_qss(p: Palette) -> str:
-    """Return the main-window stylesheet rendered from palette ``p``.
+# Spin-box and drop-down arrows. Qt's stylesheet engine does not draw the CSS
+# border-triangle trick (zero-size box, three borders): it fills the whole
+# border box, so every arrow rendered as a solid 8x5 block on Windows and
+# macOS alike. They are real images instead, drawn once per colour into a
+# cache folder; the placeholder names a direction and a palette ROLE so the
+# arrow re-themes like everything else.
+_ARROW_RE = re.compile(r"\{arrow:(up|down):(\w+)\}")
+_ARROW_W, _ARROW_H = 8, 5      # logical px; the QSS width/height match
 
-    With ``MIDNIGHT_SALMON`` the output is byte-identical to the historical
-    hardcoded stylesheet (guarded by ``tests/test_theme.py``)."""
+
+def _arrow_dir() -> str:
+    import os
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), "clawdmeter-qss")
+
+
+def _render_arrow(path: str, direction: str, color: str, scale: int) -> None:
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QColor, QImage, QPainter, QPolygonF
+    w, h = _ARROW_W * scale, _ARROW_H * scale
+    img = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+    img.fill(Qt.transparent)
+    tip, base = (h, 0) if direction == "down" else (0, h)
+    painter = QPainter(img)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QColor(color))
+    painter.drawPolygon(QPolygonF([QPointF(0, base), QPointF(w, base),
+                                   QPointF(w / 2, tip)]))
+    painter.end()
+    if not img.save(path, "PNG"):
+        raise OSError(f"could not write {path}")
+
+
+def _arrow_url(direction: str, color: str) -> str:
+    """Path of the ``direction`` arrow in ``color``, drawing it if missing.
+
+    Written as ``name.png`` + ``name@2x.png``; Qt picks the @2x file on a
+    high-DPI screen. Written to a temp name then renamed, so a second instance
+    starting at the same moment never reads a half-written file."""
+    import os
+    folder = _arrow_dir()
+    stem = f"arrow-{direction}-{color.lstrip('#').lower()}"
+    for scale, suffix in ((1, ""), (2, "@2x")):
+        path = os.path.join(folder, f"{stem}{suffix}.png")
+        if os.path.isfile(path):
+            continue
+        os.makedirs(folder, exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        _render_arrow(tmp, direction, color, scale)
+        os.replace(tmp, path)
+    return os.path.join(folder, f"{stem}.png").replace("\\", "/")
+
+
+def _swap_hexes(p: Palette) -> str:
+    """``_BASE_QSS`` with palette ``p``'s colours swapped in.
+
+    With ``MIDNIGHT_SALMON`` this is byte-identical to ``_BASE_QSS`` (guarded
+    by ``tests/test_theme.py``)."""
     return _HEX_RE.sub(lambda m: getattr(p, _QSS_HEX_TO_FIELD[m.group(0)]), _BASE_QSS)
+
+
+def build_qss(p: Palette) -> str:
+    """Return the main-window stylesheet rendered from palette ``p``."""
+    def arrow(m: re.Match) -> str:
+        try:
+            return _arrow_url(m.group(1), getattr(p, m.group(2)))
+        except Exception:
+            # No arrow beats a crash at startup: an unresolvable url() simply
+            # draws nothing, and the control still works.
+            import logging
+            logging.getLogger("clawdmeter.theme").warning(
+                "could not draw the %s arrow", m.group(1), exc_info=True)
+            return ""
+    return _ARROW_RE.sub(arrow, _swap_hexes(p))
 
 
 def active() -> Palette:

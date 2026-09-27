@@ -22,7 +22,7 @@ from theme import MIDNIGHT_SALMON, Palette, build_qss  # noqa: E402
 
 def test_default_palette_reproduces_base_qss_exactly():
     # The default theme swaps every hex for itself -> byte-identical output.
-    assert build_qss(MIDNIGHT_SALMON) == theme._BASE_QSS
+    assert theme._swap_hexes(MIDNIGHT_SALMON) == theme._BASE_QSS
 
 
 def test_default_output_carries_the_shipped_colours():
