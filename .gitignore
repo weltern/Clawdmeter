@@ -9,3 +9,6 @@ dist/
 # Generated/scratch outputs of tools/ scripts
 readme_preview.html
 ratelimit_log.jsonl
+
+# The Claude Code band: Claude Code writes its type declarations here on load.
+claude-code/clawd-band/.claude-plugin/types/

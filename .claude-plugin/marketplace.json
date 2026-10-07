@@ -1,0 +1,14 @@
+{
+  "name": "clawdmeter",
+  "owner": { "name": "Nick Welter", "url": "https://github.com/weltern" },
+  "metadata": {
+    "description": "Clawdmeter for Claude Code: Clawd and your usage limits in a band above the prompt"
+  },
+  "plugins": [
+    {
+      "name": "clawd-band",
+      "source": "./claude-code/clawd-band",
+      "description": "Clawdmeter-style band above the prompt: Clawd shows what Claude is doing, with session, weekly and context bars"
+    }
+  ]
+}

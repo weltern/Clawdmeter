@@ -13,6 +13,8 @@ process keeps it manageable:
 - **Modify, add, or relicense the Clawd mascot art.** The sprites
   (`assets/sprites/`) are © Anthropic under a deliberate carve-out — see
   [NOTICE](NOTICE) and the license section. They are not MIT-licensed.
+  `claude-code/clawd-band/hooks/sprites.ts` is generated from them by
+  `tools/build_band_sprites.py`; never edit it by hand.
 - **Add new runtime dependencies** without discussing it first. The footprint is
   intentionally tiny (PySide6 + httpx); let's keep it lean.
 - **Bundle large refactors or unrelated reformatting** into a feature/fix PR.
@@ -30,6 +32,22 @@ process keeps it manageable:
 The app checks GitHub's *latest release* on launch (then ~daily) and surfaces an
 "Update available" tray item; it compares the running `APP_VERSION` against the
 release tag, so the two must stay in lockstep.
+
+**The Claude Code band (`claude-code/clawd-band/`)** is a Claude Code plugin
+that ships from this repo; `.claude-plugin/marketplace.json` makes the repo its
+plugin source. It has its own `version` in
+`claude-code/clawd-band/.claude-plugin/plugin.json`, and users get a new
+version through `claude plugin update`.
+
+- **Never publish a GitHub Release for the band.** The app's update check reads
+  *latest release*, so a band release would be offered to every app user as a
+  Clawdmeter update. Mark a band version with a plain git tag
+  (`clawd-band-v0.1.0`) and nothing else.
+- Check it with `claude plugin validate claude-code/clawd-band` and
+  `claude plugin test claude-code/clawd-band` (needs the `claude` CLI).
+- After changing which animations it plays, or the sprites themselves, run
+  `tools/build_band_sprites.py`; `tests/test_band_sprites.py` fails while the
+  generated file is stale.
 
 **Cross-platform (Linux/macOS):** this is intentionally a Windows-focused app,
 and that's the current scope. The UI is Qt (PySide6) so a port isn't far-fetched,
