@@ -9,3 +9,6 @@ dist/
 # Generated/scratch outputs of tools/ scripts
 readme_preview.html
 ratelimit_log.jsonl
+
+# The Clawdmeter Claude Code plugin: Claude Code writes its type declarations here on load.
+claude-code/clawdmeter/.claude-plugin/types/
