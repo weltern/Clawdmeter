@@ -418,6 +418,40 @@ Updates**.
 > If you'd rather not trust a binary, [run from source](#run-from-source) or
 > [build it yourself](#building).
 
+## Clawd in Claude Code
+
+A companion plugin puts a Clawdmeter band right above the prompt in Claude Code:
+Clawd plays the same animation and activity label as the app (CODING, READING,
+INTEGRATING…), with what Claude is working on beneath it, beside your session,
+weekly and context bars.
+
+<p align="center">
+  <img src="assets/claude-code-band.png" width="760"
+       alt="The Clawdmeter band above the Claude Code prompt: an idle Clawd, session 8%, weekly 35% and context 36% bars">
+</p>
+
+```
+claude plugin marketplace add weltern/Clawdmeter
+claude plugin install clawdmeter@clawdmeter
+```
+
+- **Separate from the app.** It reads Claude Code's own usage figures and tool
+  calls, so it needs neither Clawdmeter nor a sign-in of its own, and it makes
+  no extra API calls.
+- **Desktop app and terminal.** The Claude Code desktop app shows animated Clawd
+  and graphic bars. The terminal shows the same activity and figures as text.
+- **Follows Clawdmeter's colours.** By default the bars turn darker from 75%, red from 87%,
+  and show **OVERAGE** past 100%. You get one notification the first time a
+  window passes 90%.
+- **Settings.** Click the ⚙ in the band's corner, or type `/clawdmeter`, to pick
+  which meters show (session, weekly, context, this conversation's cost), the
+  layout, the activity line, Clawd's size and glow, where the bars turn amber,
+  and whether you're notified. Changes show straight away and are kept for
+  next time.
+- **Early access.** It uses Claude Code's plugin hooks, which are still in early
+  access and can change between Claude Code releases. Update the plugin with
+  `claude plugin update clawdmeter@clawdmeter`.
+
 ## How it works
 
 It reads your Claude Code OAuth token from `~/.claude/.credentials.json` — or
@@ -548,7 +582,9 @@ The **source code** in this repository is licensed under the
 [MIT License](LICENSE).
 
 The Clawd mascot sprites and related artwork (`assets/sprites/`,
-`assets/_splash_animations.h`) are **not** covered by the MIT License. The
+`assets/_splash_animations.h`, and the Claude Code band's frames generated from
+them, `claude-code/clawdmeter/hooks/sprites.ts`) are **not** covered by the MIT
+License. The
 Clawd mascot is © Anthropic PBC and remains Anthropic's property. These assets
 are included under the same "gray area" as the upstream project and are not
 licensed for reuse — if you fork or redistribute, you are responsible for your
