@@ -436,15 +436,18 @@ claude plugin install clawdmeter@clawdmeter
 ```
 
 - **Separate from the app.** It reads Claude Code's own usage figures and tool
-  calls, so it needs neither Clawdmeter nor a sign-in of its own, and it makes
-  no extra API calls.
+  calls, so it needs neither Clawdmeter nor a sign-in of its own. The one thing
+  that makes a request of its own is the optional Fable meter (below): while
+  it's on, the plugin checks your usage page every 2 minutes with your
+  existing Claude sign-in, which it never sees.
 - **Desktop app and terminal.** The Claude Code desktop app shows animated Clawd
   and graphic bars. The terminal shows the same activity and figures as text.
 - **Follows Clawdmeter's colours.** By default the bars turn darker from 75%, red from 87%,
   and show **OVERAGE** past 100%. You get one notification the first time a
   window passes 90%.
 - **Settings.** Click the ⚙ in the band's corner, or type `/clawdmeter`, to pick
-  which meters show (session, weekly, context, this conversation's cost), the
+  which meters show (session, weekly, your weekly Fable limit, context, this
+  conversation's cost; Fable is off until you switch it on), the
   layout, the activity line, Clawd's size and glow, where the bars turn amber,
   and whether you're notified. Changes show straight away and are kept for
   next time.

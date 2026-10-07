@@ -1,6 +1,6 @@
 {
   "name": "clawdmeter",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Clawdmeter in Claude Code: a band above the prompt where Clawd shows what Claude is doing, beside your session, weekly and context bars",
   "author": { "name": "Nick Welter", "url": "https://github.com/weltern" },
   "homepage": "https://github.com/weltern/Clawdmeter#clawd-in-claude-code",

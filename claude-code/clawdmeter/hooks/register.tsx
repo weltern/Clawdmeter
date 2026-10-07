@@ -1,16 +1,17 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionCost, SessionRateLimit, SessionContextUsage } from 'claude-code'
 
-import type { Activity, Doing, Limit, MeterKey, BandSettings, Usage } from '../types'
+import type { Activity, Doing, FableState, Limit, MeterKey, BandSettings, Usage } from '../types'
 import {
   COLORS, HEAT_COLORS, LABELS, OVER_COLOR, activityFor, agoText, barSvg, clawdSvg, costText, detailFor,
-  DEFAULT_SETTINGS, heatFor, normalizeSettings, tokensText, untilText,
+  DEFAULT_SETTINGS, fableFromUsage, heatFor, normalizeSettings, scopedTitle, tokensText, untilText,
 } from './clawd'
 
 const doing = atom({ plugin: 'clawdmeter', key: 'doing' } as const, { act: 'idle', detail: '', at: 0 } as Doing)
 const usage = atom({ plugin: 'clawdmeter', key: 'usage' } as const, null as Usage | null)
 const now = atom({ plugin: 'clawdmeter', key: 'now' } as const, 0)
 const settings = atom({ plugin: 'clawdmeter', key: 'settings' } as const, DEFAULT_SETTINGS)
+const fable = atom({ plugin: 'clawdmeter', key: 'fable' } as const, null as FableState | null)
 
 const SETTINGS_KEY = 'settings'
 const PANE = 'clawdmeter-settings'
@@ -20,9 +21,32 @@ const WINDOWS: { kind: string; key: MeterKey; title: string; unit: string; name:
   { kind: 'seven_day', key: 'weekly', title: 'WEEKLY', unit: '7d', name: 'Weekly' },
 ]
 const TOAST_AT = 90
+// The order meters appear in, on the band and in the panel's What to show row
+// alike: one list, so the two can never disagree.
+const METER_ORDER: { key: MeterKey; label: string }[] = [
+  { key: 'session', label: 'Session 5h' },
+  { key: 'weekly', label: 'Weekly 7d' },
+  { key: 'fable', label: 'Fable' },
+  { key: 'context', label: 'Context' },
+  { key: 'cost', label: 'Cost' },
+]
+// The Fable meter is the one thing that makes its own request: Claude Code
+// reports only the 5h and 7d windows to plugins, and the model-scoped limits
+// live on the usage page Clawdmeter reads. Only while the meter is on, every
+// two minutes (never more than once a minute), with the session's own sign-in
+// through $.session.authorize: the credential never reaches the plugin.
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+const USAGE_HEADERS = { 'anthropic-beta': 'oauth-2025-04-20', 'anthropic-version': '2023-06-01' }
+const FABLE_EVERY_MS = 120_000
+const FABLE_MIN_GAP_MS = 60_000
 const CLAWD_PX: Record<BandSettings['clawd'], number> = { small: 32, medium: 44, large: 56, hidden: 0 }
 const SLIM_CLAWD_PX = 24
 const SLIM_BAR_PX = 48
+// The gear's own slot, kept clear however many meters share the row.
+const GEAR_CELLS = 3
+// Small enough that five meters, Clawd, the activity column and the gear fit a
+// band without the row overflowing (14 pushed the gear into the band's edge).
+const METER_MIN_CELLS = 9
 // Fixed so the meters never move when the activity text changes length.
 const ACTIVITY_WIDTH = '24%'
 const CONTEXT_FILL = '#9C9A92'
@@ -100,17 +124,46 @@ async function openSettings($: EngineInterface): Promise<void> {
 async function toastNearLimits($: EngineInterface, limits: SessionRateLimit[], at: number): Promise<void> {
   for (const w of WINDOWS) {
     const l = limits.find(x => x.kind === w.kind)
-    if (!l || l.percentUsed < TOAST_AT || l.percentUsed > 100) continue
-    const key = `toasted:${w.kind}`
-    const reset = l.resetsAt ?? 'unknown'
-    if ((await $.store.get(key)) === reset) continue
-    await $.store.set(key, reset)
-    const when = l.resetsAt ? ` ${untilText(l.resetsAt, at).replace(/^resets/, 'Resets')}.` : ''
-    $.ui.toast(`${w.name} limit at ${Math.round(l.percentUsed)}%.${when}`)
+    if (l) await toastOnce($, w.kind, w.name, l.percentUsed, l.resetsAt, at)
   }
 }
 
-type MeterView = { key: string; title: string; unit: string; pct?: number; text?: string; sub: string; fill?: string; slimName: string }
+async function toastOnce($: EngineInterface, kind: string, name: string, pct: number, resetsAt: string | undefined, at: number): Promise<void> {
+  if (pct < TOAST_AT || pct > 100) return
+  const key = `toasted:${kind}`
+  const reset = resetsAt ?? 'unknown'
+  if ((await $.store.get(key)) === reset) return
+  await $.store.set(key, reset)
+  const when = resetsAt ? ` ${untilText(resetsAt, at).replace(/^resets/, 'Resets')}.` : ''
+  $.ui.toast(`${name} limit at ${Math.round(pct)}%.${when}`)
+}
+
+type MeterView = { key: string; title: string; unit: string; pct?: number; text?: string; sub: string; fill?: string; slimName: string; overLabel: string }
+
+// When the Fable usage was last asked for; a module value, so a reload asks again.
+let lastFableCheck = 0
+
+/** Check the Fable limit if its meter is on; `force` skips the two-minute wait (not the one-minute floor). */
+async function refreshFable($: EngineInterface, force = false): Promise<void> {
+  const s = await read($, settings)
+  if (!s.meters.fable) return
+  const at = await $.clock.now()
+  if (at - lastFableCheck < (force ? FABLE_MIN_GAP_MS : FABLE_EVERY_MS - 5_000)) return
+  lastFableCheck = at
+  const keep = (problem: string) => update($, fable, f => ({ reading: f?.reading, problem, at }))
+  try {
+    const auth = await $.session.authorize()
+    if (!auth) { await keep('Needs a Claude sign-in'); return }
+    const r = await $.http.fetch(USAGE_URL, { headers: USAGE_HEADERS, auth: auth.handle })
+    if (!r.ok) { await keep(`Usage check failed (HTTP ${r.status})`); return }
+    const reading = fableFromUsage(JSON.parse(r.text))
+    if (!reading) { await update($, fable, () => ({ problem: 'No Fable limit on this account', at })); return }
+    await update($, fable, () => ({ reading, at }))
+    if (s.notify) await toastOnce($, 'fable', 'Fable', reading.percent, reading.resetsAt, at)
+  } catch {
+    await keep('Usage check failed')
+  }
+}
 
 export const register: Register = on => {
   // In-flight tool calls of the main conversation, newest last; a module value,
@@ -126,6 +179,8 @@ export const register: Register = on => {
     const started = await $.clock.now()
     await update($, now, () => started)
     $.clock.every(30_000, () => { void $.clock.now().then(t => update($, now, () => t)) })
+    $.clock.every(FABLE_EVERY_MS, () => { void refreshFable($) })
+    void refreshFable($, true)
     await $.command.register({ name: 'clawdmeter', description: 'Open the Clawdmeter settings' })
     return next(e)
   })
@@ -187,34 +242,49 @@ export const register: Register = on => {
       : (d.act === 'idle' ? THINKING_DETAIL : d.detail)
     const detail = s.detail === 'none' ? '' : s.detail === 'tool' && act !== 'idle' ? (fullDetail.split(' · ')[0] ?? '') : fullDetail
 
-    const meters: MeterView[] = []
+    // Every meter's view, then the ones switched on, in METER_ORDER.
+    const views: Partial<Record<MeterKey, MeterView>> = {}
     for (const w of WINDOWS) {
-      if (!s.meters[w.key]) continue
       const l: Limit | undefined = u?.limits.find(x => x.kind === w.kind)
-      meters.push({
+      views[w.key] = {
         key: w.kind, title: w.title, unit: w.unit, slimName: w.unit, pct: l?.percentUsed,
         sub: l ? untilText(l.resetsAt, at) : 'no reading yet',
         fill: l === undefined ? undefined : HEAT_COLORS[heatFor(l.percentUsed, s.warnAt)],
-      })
+        overLabel: 'OVERAGE',
+      }
     }
-    if (s.meters.context) {
-      meters.push({
-        key: 'context', title: 'CONTEXT', unit: '', slimName: 'ctx', pct: u?.contextPercent,
-        sub: u && u.contextTokens !== undefined ? `${tokensText(u.contextTokens)} of ${tokensText(u.contextWindow)}` : 'no reading yet',
-        fill: CONTEXT_FILL,
-      })
+    views.context = {
+      key: 'context', title: 'CONTEXT', unit: '', slimName: 'ctx', pct: u?.contextPercent,
+      sub: u && u.contextTokens !== undefined ? `${tokensText(u.contextTokens)} of ${tokensText(u.contextWindow)}` : 'no reading yet',
+      fill: CONTEXT_FILL,
+      overLabel: 'OVERAGE',
     }
-    if (s.meters.cost) {
-      meters.push({
-        key: 'cost', title: 'COST', unit: '', slimName: 'cost',
-        text: u?.costUsd === undefined ? '–' : costText(u.costUsd), sub: 'this conversation',
-      })
+    views.cost = {
+      key: 'cost', title: 'COST', unit: '', slimName: 'cost',
+      text: u?.costUsd === undefined ? '–' : costText(u.costUsd), sub: 'this conversation',
+      overLabel: 'OVERAGE',
     }
+    if (s.meters.fable) {
+      // Clawdmeter says OVER LIMIT for a scoped limit past 100%: whether it spills
+      // onto paid usage the way the 5h/7d windows do is not verified.
+      const f = await read($, fable)
+      const r = f?.reading
+      views.fable = {
+        key: 'fable', title: r ? scopedTitle(r).title : 'FABLE', unit: r ? scopedTitle(r).unit : '7d', slimName: 'fable', pct: r?.percent,
+        sub: f?.problem ?? (r ? untilText(r.resetsAt, at) : 'checking…'),
+        fill: r ? HEAT_COLORS[heatFor(r.percent, s.warnAt)] : undefined,
+        overLabel: 'OVER LIMIT',
+      }
+    }
+    const meters: MeterView[] = METER_ORDER.flatMap(({ key }) => {
+      const v = views[key]
+      return s.meters[key] && v ? [v] : []
+    })
 
     if (e.surface === 'desktop') {
       const { Box, Text, Svg, Button } = $.ui.resolve(e)
       const gear = (
-        <Box key="gear-box" alignSelf="flex-end">
+        <Box key="gear-box" alignSelf="flex-end" flexShrink={0} width={GEAR_CELLS} justifyContent="flex-end">
           <Button key="gear" label="⚙" plain dimColor onPress={() => { void openSettings($) }} />
         </Box>
       )
@@ -248,10 +318,10 @@ export const register: Register = on => {
       const meter = (m: MeterView) => {
         const over = m.pct !== undefined && m.pct > 100
         return (
-          <Box key={m.key} flexDirection="column" width={0} flexGrow={1} flexShrink={1} minWidth={14}>
+          <Box key={m.key} flexDirection="column" width={0} flexGrow={1} flexShrink={1} minWidth={METER_MIN_CELLS}>
             <Box flexDirection="row" justifyContent="space-between">
               <Text dimColor wrap="truncate">
-                {m.title}{m.unit ? ` ${m.unit}` : ''}{over ? <Text color={OVER_COLOR} bold> OVERAGE</Text> : null}
+                {m.title}{m.unit ? ` ${m.unit}` : ''}{over ? <Text color={OVER_COLOR} bold> {m.overLabel}</Text> : null}
               </Text>
               <Text bold>{m.text ?? (m.pct === undefined ? '–' : `${Math.round(m.pct)}%`)}</Text>
             </Box>
@@ -381,15 +451,18 @@ export const register: Register = on => {
         </Box>
       </Box>
     )
-    const meterNames: [MeterKey, string][] = [['session', 'Session 5h'], ['weekly', 'Weekly 7d'], ['context', 'Context'], ['cost', 'Cost']]
 
     return (
       <Box flexDirection="column" gap={1} paddingX={2} paddingY={1} width={76}>
-        {header('show', 'WHAT TO SHOW', 'Pick the meters the band shows. Any mix, at least one.', true)}
+        {header('show', 'WHAT TO SHOW', 'Pick the meters the band shows. Any mix, at least one. Fable checks your usage page every 2 minutes while it is on.', true)}
         {/* normalizeSettings keeps at least one meter on, so the last one cannot go */}
-        {segmented('meters', meterNames.map(([k, name]) => ({
+        {segmented('meters', METER_ORDER.map(({ key: k, label: name }) => ({
           key: k, label: name, isOn: s.meters[k],
-          press: () => change(x => ({ ...x, meters: { ...x.meters, [k]: !x.meters[k] } })),
+          press: () => {
+            changeSettings($, x => ({ ...x, meters: { ...x.meters, [k]: !x.meters[k] } }))
+              .then(() => (k === 'fable' ? refreshFable($, true) : undefined))
+              .catch(() => $.ui.toast("Couldn't save the Clawdmeter settings; they last until Claude Code restarts."))
+          },
         })))}
 
         {header('look', 'HOW IT LOOKS', 'Changes show on the band straight away.')}

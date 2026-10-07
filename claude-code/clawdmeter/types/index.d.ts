@@ -14,7 +14,7 @@ export type Usage = {
   costUsd?: number
 }
 
-export type MeterKey = 'session' | 'weekly' | 'context' | 'cost'
+export type MeterKey = 'session' | 'weekly' | 'context' | 'cost' | 'fable'
 
 /** The person's choices from the settings panel, kept in $.store across sessions. */
 export type BandSettings = {
@@ -29,8 +29,17 @@ export type BandSettings = {
   notify: boolean
 }
 
+/** A model-scoped limit from the usage page (`limits[]`), e.g. Weekly · Fable. */
+export type ScopedReading = { name: string; group: string; percent: number; resetsAt?: string }
+
+/**
+ * The Fable meter's last check: the last good reading is kept through a failed
+ * check (Clawdmeter's ScopedWindowTracker does the same), with what went wrong.
+ */
+export type FableState = { reading?: ScopedReading; problem?: string; at: number }
+
 declare module 'claude-code' {
   interface PluginState {
-    'clawdmeter': { doing: Doing; usage: Usage | null; now: number; settings: BandSettings }
+    'clawdmeter': { doing: Doing; usage: Usage | null; now: number; settings: BandSettings; fable: FableState | null }
   }
 }
