@@ -106,7 +106,7 @@ describe('the band', () => {
     mock.clock(on)
     mock.store(on)
     const toasts: string[] = []
-    on('ui.toast', (_$, e) => { toasts.push(e.text) })
+    on('ui.toast', (_$, e) => { toasts.push(e.text); return { value: undefined } })
     on('session.measure', (_$, e) => ({ changed: e.changed }))
     const resetsAt = new Date(Date.now() + 41 * 60000).toISOString()
     const measure = (pct: number, at = resetsAt) => $.session.measure({
@@ -122,6 +122,20 @@ describe('the band', () => {
     expect(toasts[0]).toContain('Session limit at 91%')
     await measure(92, new Date(Date.now() + 5 * 3600000).toISOString())
     expect(toasts).toHaveLength(2)
+    await $.session.measure({ context: { window: 200000 }, rateLimits: [{ kind: 'seven_day', percentUsed: 95 }], changed: ['rateLimits'] })
+    expect(toasts[2]).toBe('Weekly limit at 95%.')
+  })
+
+  test('calls a reading just past 100% overage, though it rounds to 100%', async ($, on) => {
+    mock.clock(on)
+    mock.store(on)
+    on('session.measure', (_$, e) => ({ changed: e.changed }))
+    await $.session.measure({ context: { window: 200000 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100.3 }], changed: ['rateLimits'] })
+    const ui = await $.ui.mount({ plugin: 'clawd-band', surface: 'desktop', ...working })
+    const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text).join(' | ')
+    expect(texts).toContain('OVERAGE')
+    expect(texts).toContain('100%')
+    await ui.unmount()
   })
 
   test('keeps the meters in place whatever the activity text', async ($, on) => {

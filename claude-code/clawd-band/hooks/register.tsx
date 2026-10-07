@@ -43,16 +43,22 @@ async function setDoing($: EngineInterface, act: Activity, detail: string): Prom
   await update($, doing, () => ({ act, detail, at }))
 }
 
-/** One toast per window per reset, the first time it passes 90%, remembered across sessions. */
+/**
+ * One toast per window per reset, the first time it passes 90%, remembered
+ * across sessions. One store key per window, holding the reset it last toasted
+ * for, so the store never grows past two keys.
+ */
 async function toastNearLimits($: EngineInterface, limits: SessionRateLimit[], at: number): Promise<void> {
   for (const w of WINDOWS) {
     const l = limits.find(x => x.kind === w.kind)
     if (!l || l.percentUsed < TOAST_AT || l.percentUsed > 100) continue
-    const key = `toasted:${w.kind}:${l.resetsAt ?? 'unknown'}`
-    if ((await $.store.get(key)) !== undefined) continue
-    await $.store.set(key, true)
+    const key = `toasted:${w.kind}`
+    const reset = l.resetsAt ?? 'unknown'
+    if ((await $.store.get(key)) === reset) continue
+    await $.store.set(key, reset)
     const name = w.kind === 'five_hour' ? 'Session' : 'Weekly'
-    $.ui.toast(`${name} limit at ${Math.round(l.percentUsed)}%. ${untilText(l.resetsAt, at).replace(/^resets/, 'Resets')}.`)
+    const when = l.resetsAt ? ` ${untilText(l.resetsAt, at).replace(/^resets/, 'Resets')}.` : ''
+    $.ui.toast(`${name} limit at ${Math.round(l.percentUsed)}%.${when}`)
   }
 }
 
@@ -65,8 +71,9 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const first = await $.session.usage()
     await update($, usage, () => toUsage(first.rateLimits, first.context))
-    await update($, now, () => Date.now())
-    $.clock.every(30_000, () => { void update($, now, () => Date.now()) })
+    const started = await $.clock.now()
+    await update($, now, () => started)
+    $.clock.every(30_000, () => { void $.clock.now().then(t => update($, now, () => t)) })
     return next(e)
   })
 
@@ -111,7 +118,7 @@ export const register: Register = on => {
     if (e.props.hasSurvey) return next(e)
     const d = await read($, doing)
     const u = await read($, usage)
-    const at = (await read($, now)) || Date.now()
+    const at = (await read($, now)) || (await $.clock.now())
     // The engine knows whether a turn runs; between turns Clawd is idle whatever was last seen.
     const act: Activity = e.props.isWorking ? (d.act === 'idle' ? 'thinking' : d.act) : 'idle'
     const detail = act === 'idle'
@@ -120,7 +127,7 @@ export const register: Register = on => {
 
     const meters = WINDOWS.map(w => {
       const l: Limit | undefined = u?.limits.find(x => x.kind === w.kind)
-      return { ...w, pct: l ? Math.round(l.percentUsed) : undefined, sub: l ? untilText(l.resetsAt, at) : 'no reading yet' }
+      return { ...w, pct: l?.percentUsed, sub: l ? untilText(l.resetsAt, at) : 'no reading yet' }
     })
     const ctxPct = u?.contextPercent
     const ctxSub = u && u.contextTokens !== undefined ? `${tokensText(u.contextTokens)} of ${tokensText(u.contextWindow)}` : 'no reading yet'
@@ -135,11 +142,11 @@ export const register: Register = on => {
               <Text dimColor wrap="truncate">
                 {title} {unit}{over ? <Text color={OVER_COLOR} bold> OVERAGE</Text> : null}
               </Text>
-              <Text bold>{pct === undefined ? '–' : `${pct}%`}</Text>
+              <Text bold>{pct === undefined ? '–' : `${Math.round(pct)}%`}</Text>
             </Box>
             <Svg
               source={barSvg(pct ?? 0, fill ?? HEAT_COLORS.cool)}
-              alt={pct === undefined ? `${title} ${unit}: no reading yet` : `${title} ${unit}: ${pct}% used`}
+              alt={pct === undefined ? `${title} ${unit}: no reading yet` : `${title} ${unit}: ${Math.round(pct)}% used`}
               height={6}
             />
             <Text dimColor wrap="truncate">{sub}</Text>
@@ -185,7 +192,7 @@ export const register: Register = on => {
             const b = bar(m.pct)
             return (
               <Text wrap="truncate">
-                <Text dimColor>{m.unit} </Text><Text color={b.color}>{b.on}</Text><Text dimColor>{b.off}</Text>{`${m.pct}%`.padStart(5)}
+                <Text dimColor>{m.unit} </Text><Text color={b.color}>{b.on}</Text><Text dimColor>{b.off}</Text>{`${Math.round(m.pct)}%`.padStart(5)}
               </Text>
             )
           })}
