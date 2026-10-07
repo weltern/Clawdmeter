@@ -118,8 +118,8 @@ async function openSettings($: EngineInterface): Promise<void> {
 
 /**
  * One toast per window per reset, the first time it passes 90%, remembered
- * across sessions. One store key per window, holding the reset it last toasted
- * for, so the store never grows past two keys.
+ * across sessions. One store key per window (session, weekly, Fable), holding the
+ * reset it last toasted for, so the store never grows past three keys.
  */
 async function toastNearLimits($: EngineInterface, limits: SessionRateLimit[], at: number): Promise<void> {
   for (const w of WINDOWS) {
@@ -153,7 +153,8 @@ async function refreshFable($: EngineInterface, force = false): Promise<void> {
   const keep = (problem: string) => update($, fable, f => ({ reading: f?.reading, problem, at }))
   try {
     const auth = await $.session.authorize()
-    if (!auth) { await keep('Needs a Claude sign-in'); return }
+    // The usage page takes a Claude sign-in only; an API-key session would be refused every time.
+    if (!auth || auth.kind !== 'bearer') { await keep('Needs a Claude sign-in'); return }
     const r = await $.http.fetch(USAGE_URL, { headers: USAGE_HEADERS, auth: auth.handle })
     if (!r.ok) { await keep(`Usage check failed (HTTP ${r.status})`); return }
     const reading = fableFromUsage(JSON.parse(r.text))

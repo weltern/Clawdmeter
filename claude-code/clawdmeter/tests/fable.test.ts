@@ -98,6 +98,22 @@ describe('the Fable meter', () => {
     await pane.unmount()
   })
 
+  test('no request with an API-key sign-in, which the usage page refuses', async ($, on) => {
+    const clock = mock.clock(on)
+    mock.store(on)
+    let fetched = 0
+    on('session.authorize', () => ({ value: { handle: 'key-handle', kind: 'api-key' as const } }))
+    on('http.fetch', () => { fetched++; return { value: { status: 401, ok: false, headers: {}, text: '{}' } } })
+    await clock.set(1_800_000_000_000)
+    const pane = await $.ui.mount({ plugin: 'clawdmeter', surface: 'desktop', ...PANE })
+    await pane.press({ key: 'fable' })
+    expect(fetched).toBe(0)
+    const ui = await $.ui.mount({ plugin: 'clawdmeter', surface: 'desktop', ...working })
+    expect((await ui.findAll({ type: 'Text' })).map(t => t.text).join(' | ')).toContain('Needs a Claude sign-in')
+    await ui.unmount()
+    await pane.unmount()
+  })
+
   test('no request without a Claude sign-in', async ($, on) => {
     const clock = mock.clock(on)
     mock.store(on)
