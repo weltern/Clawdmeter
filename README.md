@@ -432,7 +432,7 @@ weekly and context bars.
 
 ```
 claude plugin marketplace add weltern/Clawdmeter
-claude plugin install clawd-band@clawdmeter
+claude plugin install clawdmeter@clawdmeter
 ```
 
 - **Separate from the app.** It reads Claude Code's own usage figures and tool
@@ -440,12 +440,17 @@ claude plugin install clawd-band@clawdmeter
   no extra API calls.
 - **Desktop app and terminal.** The Claude Code desktop app shows animated Clawd
   and graphic bars. The terminal shows the same activity and figures as text.
-- **Follows Clawdmeter's colours.** The bars turn darker from 75%, red from 87%,
+- **Follows Clawdmeter's colours.** By default the bars turn darker from 75%, red from 87%,
   and show **OVERAGE** past 100%. You get one notification the first time a
   window passes 90%.
+- **Settings.** Click the ⚙ in the band's corner, or type `/clawdmeter`, to pick
+  which meters show (session, weekly, context, this conversation's cost), the
+  layout, the activity line, Clawd's size and glow, where the bars turn amber,
+  and whether you're notified. Changes show straight away and are kept for
+  next time.
 - **Early access.** It uses Claude Code's plugin hooks, which are still in early
   access and can change between Claude Code releases. Update the plugin with
-  `claude plugin update clawd-band@clawdmeter`.
+  `claude plugin update clawdmeter@clawdmeter`.
 
 ## How it works
 
@@ -578,7 +583,7 @@ The **source code** in this repository is licensed under the
 
 The Clawd mascot sprites and related artwork (`assets/sprites/`,
 `assets/_splash_animations.h`, and the Claude Code band's frames generated from
-them, `claude-code/clawd-band/hooks/sprites.ts`) are **not** covered by the MIT
+them, `claude-code/clawdmeter/hooks/sprites.ts`) are **not** covered by the MIT
 License. The
 Clawd mascot is © Anthropic PBC and remains Anthropic's property. These assets
 are included under the same "gray area" as the upstream project and are not

@@ -5,7 +5,7 @@ The MIT License (see LICENSE) covers the SOURCE CODE in this repository.
 
 It does NOT cover the bundled artwork. The following are excluded from the MIT
 License and are included only for use with this application and its Claude
-Code companion, the clawd-band plugin in claude-code/clawd-band/:
+Code companion, the Clawdmeter plugin in claude-code/clawdmeter/:
 
   * The Clawd mascot sprites and related artwork — assets/sprites/ and
     assets/_splash_animations.h. The Clawd mascot is (c) Anthropic PBC and
@@ -14,7 +14,7 @@ Code companion, the clawd-band plugin in claude-code/clawd-band/:
     assets are included under the same "gray area" as the upstream project and
     are NOT licensed for reuse. If you fork or redistribute, you are
     responsible for your own use of them.
-  * claude-code/clawd-band/hooks/sprites.ts — the same Clawd frames, generated
+  * claude-code/clawdmeter/hooks/sprites.ts — the same Clawd frames, generated
     from assets/sprites/ by tools/build_band_sprites.py so the companion can
     draw Clawd inside Claude Code. Covered by the same terms as above.
 

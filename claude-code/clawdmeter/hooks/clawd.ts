@@ -2,7 +2,7 @@
 // Clawd's animated SVG, the bar SVGs and the time and token wording.
 // Mappings and colours follow Clawdmeter (src/transcript.py, session_shelf.py).
 
-import type { Activity } from '../types'
+import type { Activity, BandSettings } from '../types'
 import { SPRITES, type Frame } from './sprites'
 
 export const LABELS: Record<Activity, string> = {
@@ -117,13 +117,23 @@ export function tokensText(n: number): string {
   return String(n)
 }
 
-/** Clawdmeter's heat steps for one window: warm from 75%, hot from 87%, overage past 100%. */
+/**
+ * Clawdmeter's heat steps for one window (uiutil.heat): warm from the warn
+ * point, hot halfway from there to 100 (75 -> 87), overage past 100%.
+ */
 export type Heat = 'cool' | 'warm' | 'hot' | 'over'
-export function heatFor(pct: number): Heat {
+export function heatFor(pct: number, warnAt = 75): Heat {
+  const warn = Math.max(0, Math.min(Math.round(warnAt), 100))
+  const hotAt = warn + Math.max(1, Math.floor((100 - warn) / 2))
   if (pct > 100) return 'over'
-  if (pct >= 87) return 'hot'
-  if (pct >= 75) return 'warm'
+  if (pct >= hotAt) return 'hot'
+  if (pct >= warn) return 'warm'
   return 'cool'
+}
+
+/** `$4.12`, `$0.38`, `$128`: what this conversation has cost so far. */
+export function costText(usd: number): string {
+  return usd >= 100 ? `$${Math.round(usd)}` : `$${usd.toFixed(2)}`
 }
 
 /** The desktop app's clay, Clawdmeter's warm step, the app's red and a deep overage red. */
@@ -139,9 +149,9 @@ const TRACK = 'rgba(140,138,131,0.28)'
 export const BAR_INTRINSIC_WIDTH = 4000
 
 /** One usage bar. Past 100% it shows only the part over, as Clawdmeter's does. */
-export function barSvg(pct: number, fill: string, height = 6): string {
+export function barSvg(pct: number, fill: string, height = 6, width = BAR_INTRINSIC_WIDTH): string {
   const shown = pct > 100 ? Math.min(pct - 100, 100) : Math.max(0, Math.min(pct, 100))
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${BAR_INTRINSIC_WIDTH}" height="${height}" viewBox="0 0 100 ${height}" preserveAspectRatio="none">` +
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 100 ${height}" preserveAspectRatio="none">` +
     `<rect width="100" height="${height}" fill="${TRACK}"/>` +
     `<rect width="${shown}" height="${height}" fill="${fill}"/></svg>`
 }
@@ -189,7 +199,7 @@ const fmt = (n: number) => String(Math.round(n * 10000) / 10000)
  * drawn once, and a timeline of `use`s switched on and off with SMIL at the
  * manifest's hold times. Needs `isInteractive` on the Svg to animate.
  */
-export function clawdSvg(act: Activity, size: number): string {
+export function clawdSvg(act: Activity, size: number, glowAmount = 50): string {
   const frames = ANIMS[act].flatMap(slug => SPRITES.anims[slug] ?? [])
   const box = cropOf(frames)
   const ids = new Map<string, number>()
@@ -212,11 +222,52 @@ export function clawdSvg(act: Activity, size: number): string {
     uses += `<use href="#f${id}" visibility="${i === 0 ? 'visible' : 'hidden'}"><animate attributeName="visibility" calcMode="discrete" values="${values}" keyTimes="${times}" dur="${total}ms" repeatCount="indefinite"/></use>`
   })
   const pad = 2
-  const glow = act === 'idle' ? '' :
-    `<filter id="g" x="-50%" y="-50%" width="200%" height="200%"><feDropShadow dx="0" dy="0" stdDeviation="0.9" flood-color="${COLORS[act]}" flood-opacity="0.9"/></filter>`
+  // Glow 0-100: none at 0, a softer and fainter halo below 50, a wider and stronger one above.
+  const blur = 0.3 + (Math.max(0, Math.min(100, glowAmount)) / 100) * 1.5
+  const strength = 0.5 + Math.max(0, Math.min(100, glowAmount)) / 200
+  const glow = act === 'idle' || glowAmount <= 0 ? '' :
+    `<filter id="g" x="-50%" y="-50%" width="200%" height="200%"><feDropShadow dx="0" dy="0" stdDeviation="${fmt(blur)}" flood-color="${COLORS[act]}" flood-opacity="${fmt(strength)}"/></filter>`
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="${-pad} ${-pad} ${box.side + pad * 2} ${box.side + pad * 2}" shape-rendering="crispEdges">` +
     // The desktop draws an interactive Svg in its own frame; a frame whose colour
     // scheme differs from the app's gets an opaque white backdrop, so follow the app's.
     `<style>:root{color-scheme:light dark;background:transparent}</style>` +
     `<defs>${glow}${defs}</defs><g${glow ? ' filter="url(#g)"' : ''}>${uses}</g></svg>`
+}
+
+export const DEFAULT_SETTINGS: BandSettings = {
+  meters: { session: true, weekly: true, context: true, cost: false },
+  layout: 'full',
+  detail: 'full',
+  clawd: 'medium',
+  glow: true,
+  glowAmount: 50,
+  warnAt: 75,
+  notify: true,
+}
+
+/** Whatever the store holds, as valid settings: unknown or bad fields fall back to the defaults. */
+export function normalizeSettings(raw: unknown): BandSettings {
+  const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+  const m = (r.meters && typeof r.meters === 'object' ? r.meters : {}) as Record<string, unknown>
+  const pick = <T extends string>(v: unknown, allowed: readonly T[], fallback: T): T =>
+    typeof v === 'string' && (allowed as readonly string[]).includes(v) ? (v as T) : fallback
+  const bool = (v: unknown, fallback: boolean) => (typeof v === 'boolean' ? v : fallback)
+  const meters = {
+    session: bool(m.session, DEFAULT_SETTINGS.meters.session),
+    weekly: bool(m.weekly, DEFAULT_SETTINGS.meters.weekly),
+    context: bool(m.context, DEFAULT_SETTINGS.meters.context),
+    cost: bool(m.cost, DEFAULT_SETTINGS.meters.cost),
+  }
+  if (!Object.values(meters).some(Boolean)) meters.session = true
+  const warn = typeof r.warnAt === 'number' && Number.isInteger(r.warnAt) && r.warnAt >= 1 && r.warnAt <= 99 ? r.warnAt : DEFAULT_SETTINGS.warnAt
+  return {
+    meters,
+    layout: pick(r.layout, ['full', 'slim'] as const, DEFAULT_SETTINGS.layout),
+    detail: pick(r.detail, ['full', 'tool', 'none'] as const, DEFAULT_SETTINGS.detail),
+    clawd: pick(r.clawd, ['small', 'medium', 'large', 'hidden'] as const, DEFAULT_SETTINGS.clawd),
+    glow: bool(r.glow, DEFAULT_SETTINGS.glow),
+    glowAmount: typeof r.glowAmount === 'number' && Number.isInteger(r.glowAmount) && r.glowAmount >= 0 && r.glowAmount <= 100 ? r.glowAmount : DEFAULT_SETTINGS.glowAmount,
+    warnAt: warn,
+    notify: bool(r.notify, DEFAULT_SETTINGS.notify),
+  }
 }

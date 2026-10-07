@@ -1,4 +1,4 @@
-"""The Claude Code band's sprite module is generated from assets/sprites and must match it."""
+"""The Clawdmeter Claude Code plugin's sprite module is generated from assets/sprites and must match it."""
 import importlib.util
 import pathlib
 
@@ -15,12 +15,12 @@ def _builder():
 def test_committed_sprites_match_assets():
     mod = _builder()
     committed = mod.OUT.read_text(encoding="utf-8")
-    assert committed == mod.build(), "claude-code/clawd-band/hooks/sprites.ts is stale: run tools/build_band_sprites.py"
+    assert committed == mod.build(), "claude-code/clawdmeter/hooks/sprites.ts is stale: run tools/build_band_sprites.py"
 
 
 def test_band_plays_only_animations_the_app_ships():
     mod = _builder()
-    clawd_ts = (ROOT / "claude-code" / "clawd-band" / "hooks" / "clawd.ts").read_text(encoding="utf-8")
+    clawd_ts = (ROOT / "claude-code" / "clawdmeter" / "hooks" / "clawd.ts").read_text(encoding="utf-8")
     import json
     manifest = json.loads((ROOT / "assets" / "sprites" / "manifest.json").read_text(encoding="utf-8"))
     slugs = {manifest["animations"][name]["slug"] for name in mod.ANIMATIONS}

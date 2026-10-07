@@ -13,7 +13,7 @@ process keeps it manageable:
 - **Modify, add, or relicense the Clawd mascot art.** The sprites
   (`assets/sprites/`) are © Anthropic under a deliberate carve-out — see
   [NOTICE](NOTICE) and the license section. They are not MIT-licensed.
-  `claude-code/clawd-band/hooks/sprites.ts` is generated from them by
+  `claude-code/clawdmeter/hooks/sprites.ts` is generated from them by
   `tools/build_band_sprites.py`; never edit it by hand.
 - **Add new runtime dependencies** without discussing it first. The footprint is
   intentionally tiny (PySide6 + httpx); let's keep it lean.
@@ -33,18 +33,18 @@ The app checks GitHub's *latest release* on launch (then ~daily) and surfaces an
 "Update available" tray item; it compares the running `APP_VERSION` against the
 release tag, so the two must stay in lockstep.
 
-**The Claude Code band (`claude-code/clawd-band/`)** is a Claude Code plugin
+**The Clawdmeter Claude Code plugin (`claude-code/clawdmeter/`)** is a Claude Code plugin
 that ships from this repo; `.claude-plugin/marketplace.json` makes the repo its
 plugin source. It has its own `version` in
-`claude-code/clawd-band/.claude-plugin/plugin.json`, and users get a new
+`claude-code/clawdmeter/.claude-plugin/plugin.json`, and users get a new
 version through `claude plugin update`.
 
-- **Never publish a GitHub Release for the band.** The app's update check reads
-  *latest release*, so a band release would be offered to every app user as a
-  Clawdmeter update. Mark a band version with a plain git tag
-  (`clawd-band-v0.1.0`) and nothing else.
-- Check it with `claude plugin validate claude-code/clawd-band` and
-  `claude plugin test claude-code/clawd-band` (needs the `claude` CLI).
+- **Never publish a GitHub Release for the plugin.** The app's update check reads
+  *latest release*, so a plugin release would be offered to every app user as a
+  Clawdmeter update. Mark a plugin version with a plain git tag
+  (`claude-plugin-v0.2.0`) and nothing else.
+- Check it with `claude plugin validate claude-code/clawdmeter` and
+  `claude plugin test claude-code/clawdmeter` (needs the `claude` CLI).
 - After changing which animations it plays, or the sprites themselves, run
   `tools/build_band_sprites.py`; `tests/test_band_sprites.py` fails while the
   generated file is stale.

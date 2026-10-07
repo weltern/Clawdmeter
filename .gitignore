@@ -10,5 +10,5 @@ dist/
 readme_preview.html
 ratelimit_log.jsonl
 
-# The Claude Code band: Claude Code writes its type declarations here on load.
-claude-code/clawd-band/.claude-plugin/types/
+# The Clawdmeter Claude Code plugin: Claude Code writes its type declarations here on load.
+claude-code/clawdmeter/.claude-plugin/types/

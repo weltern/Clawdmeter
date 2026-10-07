@@ -1,8 +1,8 @@
-"""Generate the Claude Code band's sprite module from assets/sprites.
+"""Generate the Clawdmeter Claude Code plugin's sprite module from assets/sprites.
 
-The clawd-band plugin (claude-code/clawd-band) draws Clawd in Claude Code. Its
+The Clawdmeter plugin (claude-code/clawdmeter) draws Clawd in Claude Code. Its
 frames are not a second copy of the art kept by hand: this script derives
-claude-code/clawd-band/hooks/sprites.ts from the same assets/sprites PNGs and
+claude-code/clawdmeter/hooks/sprites.ts from the same assets/sprites PNGs and
 manifest the app plays, so the two can never drift (tests/test_band_sprites.py
 fails if the committed file differs from what this script would write).
 
@@ -23,9 +23,9 @@ from PySide6.QtGui import QImage
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SPRITES = ROOT / "assets" / "sprites"
-OUT = ROOT / "claude-code" / "clawd-band" / "hooks" / "sprites.ts"
+OUT = ROOT / "claude-code" / "clawdmeter" / "hooks" / "sprites.ts"
 
-# The animations the band plays; must match ANIMS in claude-code/clawd-band/hooks/clawd.ts.
+# The animations the plugin plays; must match ANIMS in claude-code/clawdmeter/hooks/clawd.ts.
 ANIMATIONS = ["work coding", "work think", "idle look around", "idle blink", "expression surprise", "idle breathe"]
 
 HEADER = """\

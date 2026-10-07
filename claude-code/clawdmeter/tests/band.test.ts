@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import { activityFor, clawdSvg, detailFor, heatFor, prettyTool, untilText } from '../hooks/clawd'
+import { DEFAULT_SETTINGS, activityFor, clawdSvg, detailFor, heatFor, normalizeSettings, prettyTool, untilText } from '../hooks/clawd'
 
 const site = { maxRows: 6, bodyColumns: 96, scroll: { offset: 0, bodyRows: 6 }, view: {} }
 const working = { component: 'AbovePrompt', props: { ...site, hasSurvey: false, isWorking: true } } as const
@@ -45,7 +45,7 @@ describe('the band', () => {
     const seen: Record<string, string> = {}
     on('tool.call', async () => {
       for (const surface of SURFACES) {
-        const ui = await $.ui.mount({ plugin: 'clawd-band', surface, ...working })
+        const ui = await $.ui.mount({ plugin: 'clawdmeter', surface, ...working })
         seen[surface] = (await ui.findAll({ type: 'Text' })).map(t => t.text).join(' | ')
         await ui.unmount()
       }
@@ -56,7 +56,7 @@ describe('the band', () => {
       expect(seen[surface]).toContain('CODING')
       expect(seen[surface]).toContain('Edit · CHANGELOG.md')
     }
-    const after = await $.ui.mount({ plugin: 'clawd-band', surface: 'desktop', ...working })
+    const after = await $.ui.mount({ plugin: 'clawdmeter', surface: 'desktop', ...working })
     expect(await after.find({ type: 'Text', text: /THINKING/ })).toBeDefined()
     await after.unmount()
   })
@@ -65,7 +65,7 @@ describe('the band', () => {
     mock.clock(on)
     on('tool.call', async () => ({ result: {} as never }))
     await $.tool.call({ tool: 'Grep', pattern: 'x' })
-    const ui = await $.ui.mount({ plugin: 'clawd-band', surface: 'desktop', ...idle })
+    const ui = await $.ui.mount({ plugin: 'clawdmeter', surface: 'desktop', ...idle })
     expect(await ui.find({ type: 'Text', text: /IDLE/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /READING|THINKING/ })).toBeUndefined()
     await ui.unmount()
@@ -83,7 +83,7 @@ describe('the band', () => {
       ],
       changed: ['context', 'rateLimits'],
     })
-    const ui = await $.ui.mount({ plugin: 'clawd-band', surface: 'desktop', ...working })
+    const ui = await $.ui.mount({ plugin: 'clawdmeter', surface: 'desktop', ...working })
     const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text).join(' | ')
     expect(texts).toContain('106%')
     expect(texts).toContain('OVERAGE')
@@ -131,7 +131,7 @@ describe('the band', () => {
     mock.store(on)
     on('session.measure', (_$, e) => ({ changed: e.changed }))
     await $.session.measure({ context: { window: 200000 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100.3 }], changed: ['rateLimits'] })
-    const ui = await $.ui.mount({ plugin: 'clawd-band', surface: 'desktop', ...working })
+    const ui = await $.ui.mount({ plugin: 'clawdmeter', surface: 'desktop', ...working })
     const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text).join(' | ')
     expect(texts).toContain('OVERAGE')
     expect(texts).toContain('100%')
@@ -142,7 +142,7 @@ describe('the band', () => {
     mock.clock(on)
     const layout: string[] = []
     on('tool.call', async () => {
-      const ui = await $.ui.mount({ plugin: 'clawd-band', surface: 'desktop', ...working })
+      const ui = await $.ui.mount({ plugin: 'clawdmeter', surface: 'desktop', ...working })
       const boxes = ['activity', 'five_hour', 'seven_day', 'context']
       const props = await Promise.all(boxes.map(async key => (await ui.find({ key }))?.props))
       for (const p of props) expect(p).toBeDefined()
@@ -165,7 +165,7 @@ describe('the band', () => {
       const { Box } = eng.ui.resolve(e)
       return h(Box, {}) as never
     })
-    const ui = await $.ui.mount({ plugin: 'clawd-band', surface: 'desktop', component: 'AbovePrompt', props: { ...working.props, hasSurvey: true } })
+    const ui = await $.ui.mount({ plugin: 'clawdmeter', surface: 'desktop', component: 'AbovePrompt', props: { ...working.props, hasSurvey: true } })
     expect(passed).toBe(true)
     expect(await ui.find({ type: 'Text', text: /CODING|THINKING|IDLE/ })).toBeUndefined()
     await ui.unmount()
