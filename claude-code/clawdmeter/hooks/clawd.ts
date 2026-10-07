@@ -2,7 +2,7 @@
 // Clawd's animated SVG, the bar SVGs and the time and token wording.
 // Mappings and colours follow Clawdmeter (src/transcript.py, session_shelf.py).
 
-import type { Activity, BandSettings } from '../types'
+import type { Activity, BandSettings, ScopedReading } from '../types'
 import { SPRITES, type Frame } from './sprites'
 
 export const LABELS: Record<Activity, string> = {
@@ -235,7 +235,7 @@ export function clawdSvg(act: Activity, size: number, glowAmount = 50): string {
 }
 
 export const DEFAULT_SETTINGS: BandSettings = {
-  meters: { session: true, weekly: true, context: true, cost: false },
+  meters: { session: true, weekly: true, context: true, cost: false, fable: false },
   layout: 'full',
   detail: 'full',
   clawd: 'medium',
@@ -257,6 +257,7 @@ export function normalizeSettings(raw: unknown): BandSettings {
     weekly: bool(m.weekly, DEFAULT_SETTINGS.meters.weekly),
     context: bool(m.context, DEFAULT_SETTINGS.meters.context),
     cost: bool(m.cost, DEFAULT_SETTINGS.meters.cost),
+    fable: bool(m.fable, DEFAULT_SETTINGS.meters.fable),
   }
   if (!Object.values(meters).some(Boolean)) meters.session = true
   const warn = typeof r.warnAt === 'number' && Number.isInteger(r.warnAt) && r.warnAt >= 1 && r.warnAt <= 99 ? r.warnAt : DEFAULT_SETTINGS.warnAt
@@ -270,4 +271,45 @@ export function normalizeSettings(raw: unknown): BandSettings {
     warnAt: warn,
     notify: bool(r.notify, DEFAULT_SETTINGS.notify),
   }
+}
+
+/**
+ * The Fable limit out of the usage page's `limits[]`, read the way Clawdmeter's
+ * scoped_windows.py reads it: the scope's model (or surface) display name, the
+ * entry's `percent` (not clamped at 100), its `group` and `resets_at`. Null when
+ * no scoped entry names Fable, which is what an account without that limit sees.
+ */
+export function fableFromUsage(body: unknown): ScopedReading | null {
+  const limits = body && typeof body === 'object' ? (body as { limits?: unknown }).limits : undefined
+  if (!Array.isArray(limits)) return null
+  for (const entry of limits) {
+    if (!entry || typeof entry !== 'object') continue
+    const e = entry as Record<string, unknown>
+    const scope = (e.scope && typeof e.scope === 'object' ? e.scope : {}) as Record<string, unknown>
+    let name: string | undefined
+    for (const part of ['model', 'surface']) {
+      let v = scope[part]
+      if (v && typeof v === 'object') v = (v as Record<string, unknown>).display_name
+      if (typeof v === 'string' && v.trim()) { name = v.trim(); break }
+    }
+    const pct = e.percent
+    if (!name || !/fable/i.test(name) || typeof pct !== 'number' || !Number.isFinite(pct)) continue
+    return {
+      name,
+      group: typeof e.group === 'string' ? e.group.trim().toLowerCase() : '',
+      percent: pct,
+      resetsAt: typeof e.resets_at === 'string' ? e.resets_at : undefined,
+    }
+  }
+  return null
+}
+
+/**
+ * A scoped limit's title and unit, matching the band's SESSION 5h / WEEKLY 7d:
+ * `FABLE` + `7d` for a weekly window (Nick's call over Clawdmeter's longer
+ * `WEEKLY · FABLE`, which truncated with five meters on).
+ */
+export function scopedTitle(r: ScopedReading): { title: string; unit: string } {
+  const unit = r.group === 'weekly' ? '7d' : r.group === 'session' ? '5h' : r.group
+  return { title: r.name.toUpperCase(), unit }
 }
