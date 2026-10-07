@@ -427,7 +427,7 @@ weekly and context bars.
 
 <p align="center">
   <img src="assets/claude-code-band.png" width="760"
-       alt="The Clawdmeter band above the Claude Code prompt: an idle Clawd, session 8%, weekly 35% and context 36% bars">
+       alt="The Clawdmeter band above the Claude Code prompt: Clawd thinking, session 20%, weekly 36% and context 74% bars, and the settings gear in its corner">
 </p>
 
 ```
