@@ -21,6 +21,22 @@ _TARGET_ARCH = os.environ.get("CLAWD_TARGET_ARCH") or None
 _IS_WIN = sys.platform == 'win32'
 _IS_MAC = sys.platform == 'darwin'
 
+# --- Build identity ------------------------------------------------------------
+# Stamp the git commit (and whether this is exactly the release tag, and whether
+# the tree had local changes) into src/_build_info.py, so the About box -- and
+# the Windows ProductVersion below -- can't pass a dev build off as a release.
+# See src/build_info.py. Never fails the build: no git just means "unknown".
+import re as _re
+sys.path.insert(0, os.path.abspath('src'))
+import build_info as _build_info_mod
+
+with open('src/app_settings.py', encoding='utf-8') as _f:
+    _m0 = _re.search(r'APP_VERSION\s*=\s*["\']([0-9]+(?:\.[0-9]+)*)["\']', _f.read())
+_BUILD = _build_info_mod.write_stamp(_m0.group(1) if _m0 else '0.0.0')
+_VERSION_LABEL = _build_info_mod.version_label(
+    _m0.group(1) if _m0 else '0.0.0', _BUILD)
+print(f'Clawdmeter build identity: {_VERSION_LABEL}')
+
 a = Analysis(
     ['src/main.py'],
     pathex=['src'],
@@ -51,8 +67,10 @@ a = Analysis(
     # the only symptom is the authorisation dialog naming *security* again
     # and an "Always Allow" grant attaching to that shared binary instead
     # of to us — the two things this was changed to fix.
-    hiddenimports=(['AppKit', 'Security', 'ServiceManagement']
-                   if _IS_MAC else []),
+    # _build_info is imported by name at runtime (build_info.current), which
+    # static analysis can't see.
+    hiddenimports=['_build_info'] + (['AppKit', 'Security', 'ServiceManagement']
+                                     if _IS_MAC else []),
     hookspath=[],
     runtime_hooks=[],
     excludes=[
@@ -206,7 +224,11 @@ if sys.platform == 'win32':
                                  'Clawd mascot © Anthropic PBC'),
                     StringStruct('OriginalFilename', 'Clawdmeter.exe'),
                     StringStruct('ProductName', 'Clawdmeter'),
-                    StringStruct('ProductVersion', _ver_str),
+                    # The label, not the bare number: "3.1.0+dev.1d4a1cc" for
+                    # anything but the tagged release, so Explorer's Details
+                    # tab tells the builds apart too. FileVersion and the
+                    # fixed-info tuples stay numeric, as Windows requires.
+                    StringStruct('ProductVersion', _VERSION_LABEL),
                     StringStruct('Comments',
                                  'Unofficial; not affiliated with Anthropic. '
                                  'github.com/weltern/Clawdmeter'),
