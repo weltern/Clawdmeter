@@ -12,6 +12,10 @@ const usage = atom({ plugin: 'clawdmeter', key: 'usage' } as const, null as Usag
 const now = atom({ plugin: 'clawdmeter', key: 'now' } as const, 0)
 const settings = atom({ plugin: 'clawdmeter', key: 'settings' } as const, DEFAULT_SETTINGS)
 const fable = atom({ plugin: 'clawdmeter', key: 'fable' } as const, null as FableState | null)
+// False once the session is known to sign in without a Claude plan (an API key,
+// Bedrock, Vertex, Foundry or a gateway): those have no 5h / 7d limits, so the
+// Session and Weekly meters would sit at "no reading yet" forever.
+const planLimits = atom({ plugin: 'clawdmeter', key: 'planLimits' } as const, true)
 
 const SETTINGS_KEY = 'settings'
 const PANE = 'clawdmeter-settings'
@@ -166,6 +170,16 @@ async function refreshFable($: EngineInterface, force = false): Promise<void> {
   }
 }
 
+/** Only a Claude sign-in (a bearer token) has plan limits; anything else is known not to. */
+async function checkPlanLimits($: EngineInterface): Promise<void> {
+  try {
+    const auth = await $.session.authorize()
+    await update($, planLimits, () => auth?.kind === 'bearer')
+  } catch {
+    // Unknown: keep showing the meters, as before.
+  }
+}
+
 export const register: Register = on => {
   // In-flight tool calls of the main conversation, newest last; a module value,
   // so a reload starts it empty (the next call or turn sets things right).
@@ -182,6 +196,7 @@ export const register: Register = on => {
     $.clock.every(30_000, () => { void $.clock.now().then(t => update($, now, () => t)) })
     $.clock.every(FABLE_EVERY_MS, () => { void refreshFable($) })
     void refreshFable($, true)
+    void checkPlanLimits($)
     await $.command.register({ name: 'clawdmeter', description: 'Open the Clawdmeter settings' })
     return next(e)
   })
@@ -277,8 +292,12 @@ export const register: Register = on => {
         overLabel: 'OVER LIMIT',
       }
     }
+    // Without a Claude plan there are no 5h / 7d limits to show; hide those two
+    // meters rather than leave them empty. A reading that does arrive still shows.
+    const plan = await read($, planLimits)
     const meters: MeterView[] = METER_ORDER.flatMap(({ key }) => {
       const v = views[key]
+      if (!plan && (key === 'session' || key === 'weekly') && v?.pct === undefined) return []
       return s.meters[key] && v ? [v] : []
     })
 

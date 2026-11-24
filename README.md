@@ -451,6 +451,9 @@ claude plugin install clawdmeter@clawdmeter
   layout, the activity line, Clawd's size and glow, where the bars turn amber,
   and whether you're notified. Changes show straight away and are kept for
   next time.
+- **Accounts without plan limits.** When Claude Code signs in with an API key,
+  Bedrock, Vertex, Foundry or a gateway, there are no session or weekly limits,
+  so those two meters stay hidden and context and cost still show.
 - **Early access.** It uses Claude Code's plugin hooks, which are still in early
   access and can change between Claude Code releases. Update the plugin with
   `claude plugin update clawdmeter@clawdmeter`.
@@ -467,6 +470,59 @@ spend and per-model limits. The Stats page values your **local transcripts**
 against a bundled price map — no extra API calls. The window minimises to the
 system tray; closing the window hides it. **Quit** from the tray menu fully
 exits.
+
+## Using Clawdmeter at work
+
+The aim is simple: if Claude Code works on your machine, Clawdmeter should too.
+
+- **Single sign-on.** Nothing extra to set up. If your organisation signs in to
+  Claude through SSO, that happens in the browser during Claude Code's own
+  sign-in, and Clawdmeter reads the token it leaves behind. **Sign in again**
+  runs the same `claude auth login`.
+- **Certificates.** Clawdmeter trusts your system's certificate store (Windows,
+  macOS and Linux), so a proxy that inspects encrypted traffic with your
+  company's own root certificate (Zscaler, Netskope and similar) works without
+  any setup. If your company's CA is only in a file, the `NODE_EXTRA_CA_CERTS`
+  you set for Claude Code is used too.
+- **Proxy.** Clawdmeter uses, in this order: proxy variables already in its
+  environment (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`), then the `env` block of
+  Claude Code's managed settings and of `~/.claude/settings.json` (or the
+  folder `CLAUDE_CONFIG_DIR` names), then the system proxy (Internet Options on
+  Windows, network settings on macOS) with its bypass list. Proxy auto-config
+  (PAC) files and proxies that need NTLM or Kerberos sign-in aren't supported,
+  which is true of Claude Code as well.
+- **To switch off** the system certificate store, set `CLAWDMETER_SYSTEM_CERTS=0`.
+
+**Hosts to allow.** Only the first two are needed; the rest are for features
+you can leave off.
+
+| Host | Used for |
+| --- | --- |
+| `api.anthropic.com` | Your usage, plan and limits |
+| `platform.claude.com` | Renewing the sign-in token (Windows and Linux, with auto-refresh on), and the model price list |
+| `api.github.com`, `github.com` | Checking for app updates |
+| `claude.com` | Plan prices on the Stats page |
+| `ntfy.sh`, `api.telegram.org`, `discord.com`, `hooks.slack.com`, `api.pushover.net`, your Gotify or webhook server | Phone and chat notifications, only the ones you switch on |
+
+**The Claude Code plugin** signs in and connects through Claude Code itself, so
+it follows Claude Code's proxy and certificate settings with nothing to set up.
+If your organisation controls plugins with managed settings, an admin can allow
+it like this:
+
+```json
+{
+  "strictKnownMarketplaces": [
+    { "source": "github", "repo": "weltern/Clawdmeter" }
+  ],
+  "extraKnownMarketplaces": {
+    "clawdmeter": { "source": { "source": "github", "repo": "weltern/Clawdmeter" } }
+  },
+  "enabledPlugins": { "clawdmeter@clawdmeter": true }
+}
+```
+
+If the network can't reach GitHub, the `claude-code/clawdmeter` folder can be
+copied into your organisation's own plugin marketplace instead.
 
 ## Linux notes
 

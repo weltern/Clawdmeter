@@ -3,6 +3,13 @@
 The Claude Code plugin in this folder has its own version, separate from the
 Clawdmeter app. Each version is tagged `claude-plugin-vX.Y.Z` on `main`.
 
+## Unreleased
+
+- **Accounts without plan limits.** When Claude Code signs in with an API key,
+  Bedrock, Vertex, Foundry or a gateway, the Session and Weekly meters are
+  hidden instead of showing "no reading yet" forever. Context and cost still
+  show, and a limit that does arrive is still drawn.
+
 ## 0.3.0 (first release)
 
 - **Clawd above your prompt.** A band above the Claude Code prompt where Clawd
