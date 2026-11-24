@@ -147,6 +147,16 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      # Pin the interpreter like the test job does. build.ps1 creates its venv
+      # with `py -3`, which on the runner now resolves to a Python newer than
+      # the pinned PySide6 supports (no wheel), failing the requirements step.
+      # A .venv made here is reused by build.ps1 as-is.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Create venv
+        shell: pwsh
+        run: python -m venv .venv
       - name: Build
         shell: pwsh
         run: ./build.ps1
