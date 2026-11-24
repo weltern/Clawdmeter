@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication
 import app_settings
 import pricing_refresh
 import macos_launch
+import netconfig
 import run_at_startup
 import single_instance
 import theme
@@ -79,6 +80,10 @@ def show_unless_tray_appears(win, *, grace_ms: int = TRAY_GRACE_MS,
 def main() -> int:
     mock = "--mock" in sys.argv
     startup = run_at_startup.STARTUP_FLAG in sys.argv  # launched at sign-in
+    # Before anything makes a request: trust the system certificate store and
+    # pick up the proxy Claude Code or the system uses, so work networks with
+    # an inspecting proxy don't read as "offline". See netconfig.py.
+    netconfig.apply()
     app = QApplication(sys.argv)
     # The OS colour-scheme hint (for native / un-QSS'd surfaces — notably macOS
     # native text) is set to match the active theme by apply_theme() below, so a

@@ -40,6 +40,6 @@ export type FableState = { reading?: ScopedReading; problem?: string; at: number
 
 declare module 'claude-code' {
   interface PluginState {
-    'clawdmeter': { doing: Doing; usage: Usage | null; now: number; settings: BandSettings; fable: FableState | null }
+    'clawdmeter': { doing: Doing; usage: Usage | null; now: number; settings: BandSettings; fable: FableState | null; planLimits: boolean }
   }
 }

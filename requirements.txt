@@ -1,5 +1,9 @@
 PySide6==6.11.1
 httpx==0.27.2
+# The OS certificate store for TLS (Windows, macOS, Linux), so a work network
+# that inspects TLS with its own root certificate still verifies. See
+# src/netconfig.py.
+truststore==0.10.1
 # macOS only: the native NSColorSampler system eyedropper (AppKit) for the theme
 # editor's colour picker. The marker keeps it off Windows/Linux, where the DIY
 # screenshot-overlay eyedropper is used instead.
