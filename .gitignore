@@ -12,3 +12,6 @@ ratelimit_log.jsonl
 
 # The Clawdmeter Claude Code plugin: Claude Code writes its type declarations here on load.
 claude-code/clawdmeter/.claude-plugin/types/
+
+# Build identity stamped by Clawdmeter.spec (build_info.write_stamp)
+src/_build_info.py

@@ -106,3 +106,43 @@ def test_a_working_poll_clears_it(dash):
     dash._on_sample(_good())
 
     assert not dash.settings_panel._reauth_needed
+
+
+def test_claudes_reason_reaches_settings_and_the_badge(dash, monkeypatch, tmp_path):
+    """Found on 2026-11-22: a revoked token showed only "Sign in again"; the
+    cause took a hand-made API probe to find. Claude's own words now show in
+    the Connection tab and on hovering the badge."""
+    import json
+    cred = tmp_path / ".credentials.json"
+    cred.write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": "a", "refreshToken": "r",
+        "expiresAt": int((time.time() + 900) * 1000)}}), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CREDENTIALS_PATH", str(cred))
+    reason = "OAuth access token has been revoked."
+    s = UsageSample(0, 0, 0, 0, poller.STATUS_REAUTH_NEEDED, False,
+                    f"HTTP 401: {reason}", time.time(), reason=reason)
+
+    dash._on_sample(s)
+    dash.settings_panel.refresh_token_status()
+
+    assert reason in dash.settings_panel.token_status.text()
+    assert dash.settings_panel.reauth_btn.isEnabled()
+    assert dash.status_container.toolTip() == reason
+
+    dash._on_sample(_good())
+    assert dash.status_container.toolTip() == ""
+    assert dash.settings_panel._reauth_reason is None
+
+
+def test_details_paused_note_follows_the_samples(dash):
+    note = dash.settings_panel.details_paused_note
+    paused = _good()
+    paused.details_paused_until = time.time() + 3600
+    dash._on_sample(paused)
+    assert not note.isHidden() and "rate-limiting" in note.text()
+
+    dash._on_sample(_bad(poller.STATUS_OFFLINE))    # says nothing about it
+    assert not note.isHidden()
+
+    dash._on_sample(_good())
+    assert note.isHidden()

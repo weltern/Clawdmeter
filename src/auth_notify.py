@@ -41,7 +41,7 @@ _LOST_BODIES = {
     "auth-expired":
         "The Claude token expired. Clawdmeter is trying to refresh it.",
     "reauth-needed":
-        "The Claude token expired and can't be refreshed — sign in again "
+        "The Claude token stopped working and can't be refreshed — sign in again "
         "from Settings, or run: claude auth login",
     "no-token":
         "No Claude credentials were found, so usage can't be read.",
@@ -59,6 +59,13 @@ class AuthAlert:
     title: str
     body: str
     status: str    # the poller status that triggered it ("" when restored)
+
+
+def _with_reason(body: str, s) -> str:
+    """Append Claude's own explanation, when it gave one. "Revoked" and
+    "expired" are both a 401, and only this text tells them apart."""
+    reason = getattr(s, "reason", None)
+    return f"{body} Claude said: \u201c{reason}\u201d" if reason else body
 
 
 class AuthNotifier:
@@ -94,8 +101,8 @@ class AuthNotifier:
             # doesn't immediately fire about a condition that began long ago.
             if not enabled:
                 return None
-            return AuthAlert("lost", LOST_TITLE,
-                             _LOST_BODIES.get(status, "Usage can't be read."), status)
+            return AuthAlert("lost", LOST_TITLE, _with_reason(
+                _LOST_BODIES.get(status, "Usage can't be read."), s), status)
 
         # Already blind, and the failure has just become one only the user can
         # fix. Once per outage: flipping back and forth must not repeat it.
@@ -103,7 +110,8 @@ class AuthNotifier:
             self._told_reauth = True
             if not enabled:
                 return None
-            return AuthAlert("lost", REAUTH_TITLE, _LOST_BODIES[status], status)
+            return AuthAlert("lost", REAUTH_TITLE,
+                             _with_reason(_LOST_BODIES[status], s), status)
 
         # Recovery is a real OK sample, never merely "a different failure".
         # An offline sample after an expiry must not read as "all better now".

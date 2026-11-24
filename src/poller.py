@@ -99,6 +99,14 @@ class UsageSample:
     # the usage request didn't succeed this poll — NOT "no scoped limits",
     # which is an empty list — so the dashboard can keep the last-known ones.
     scoped_windows: list[ScopedWindow] | None = None
+    # Claude's own explanation when it refused the probe, e.g. "OAuth access
+    # token has been revoked." Kept apart from `error` (which also carries the
+    # status line) so the UI can quote it verbatim. None when Claude gave none.
+    reason: str | None = None
+    # Epoch seconds until which the usage/profile details are paused because
+    # that endpoint answered 429. None = not paused. The fields above then
+    # hold the last values that endpoint DID return.
+    details_paused_until: float | None = None
 
 
 def credentials_path() -> Path:
@@ -244,7 +252,164 @@ def usage_fields_from_json(usage: dict | None, profile: dict | None) -> dict:
     }
 
 
-def _poll_once(token: str) -> UsageSample:
+# How often the OAuth usage / profile endpoints are asked, at most. The probe
+# above runs every poll (as often as every 10 s); these two used to ride along
+# on every one, so they were two thirds of the app's API traffic -- and the
+# usage endpoint rate-limits on its own, with Retry-After of up to an hour. Its
+# data (extra-usage spend, scoped windows) moves slowly, and the profile only
+# carries the plan tier, which practically never changes.
+USAGE_DETAILS_INTERVAL = 300.0
+PROFILE_INTERVAL = 3600.0
+# After a failure that is not a 429: retry soon, but not on every poll.
+DETAILS_RETRY_AFTER_ERROR = 60.0
+# A 429 with no usable Retry-After: back off this long, doubling per repeat.
+DETAILS_429_DEFAULT = 300.0
+# Never trust a Retry-After beyond this; a garbled header must not silence
+# the details for days.
+DETAILS_429_MAX = 6 * 3600.0
+_REASON_MAX_CHARS = 200
+
+
+def api_error_reason(response) -> str | None:
+    """Claude's own message from an error response, or None.
+
+    Anthropic error bodies are ``{"type": "error", "error": {"type": ...,
+    "message": "OAuth access token has been revoked."}}``. That message is
+    the only place a revoked token is told apart from an expired one -- both
+    are a 401 -- so it is worth showing rather than discarding. Defensive: any
+    other body shape (HTML from a proxy, empty, non-JSON) gives None.
+    """
+    try:
+        body = response.json()
+    except (ValueError, TypeError):
+        return None
+    err = body.get("error") if isinstance(body, dict) else None
+    msg = err.get("message") if isinstance(err, dict) else None
+    if not isinstance(msg, str):
+        return None
+    msg = " ".join(msg.split())
+    if not msg:
+        return None
+    if len(msg) > _REASON_MAX_CHARS:
+        msg = msg[:_REASON_MAX_CHARS - 1].rstrip() + "\u2026"
+    return msg
+
+
+def retry_after_seconds(value, now: float) -> float | None:
+    """Parse a Retry-After header (delta-seconds or an HTTP date) to seconds
+    from ``now``. None when missing or unparseable."""
+    if value is None:
+        return None
+    value = str(value).strip()
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if dt is None:
+        return None
+    return max(0.0, dt.timestamp() - now)
+
+
+class UsageDetails:
+    """Throttle and cache for the OAuth usage + profile requests.
+
+    Owned by the poll thread and handed to every _poll_once, so the slow-moving
+    details are fetched every few minutes instead of every poll, a 429 is
+    honoured for as long as its Retry-After says, and in between the last
+    values that WERE returned are re-applied (a quiet hold, not a blank).
+
+    Not thread-safe; only the poll thread touches it.
+    """
+
+    def __init__(self) -> None:
+        self._usage: dict | None = None
+        self._profile: dict | None = None
+        self._usage_due = 0.0
+        self._profile_due = 0.0
+        self._paused_until: float | None = None
+        self._backoff = DETAILS_429_DEFAULT
+        self._token: str | None = None
+
+    @property
+    def paused_until(self) -> float | None:
+        return self._paused_until
+
+    def _rate_limited(self, resp, now: float) -> None:
+        wait = retry_after_seconds(resp.headers.get("retry-after"), now)
+        if wait is None:
+            wait = self._backoff
+            self._backoff = min(self._backoff * 2, DETAILS_429_MAX)
+        wait = min(max(wait, USAGE_DETAILS_INTERVAL), DETAILS_429_MAX)
+        self._paused_until = now + wait
+        self._usage_due = self._profile_due = self._paused_until
+
+    def fetch(self, http, headers: dict, token: str, now: float) -> None:
+        """Ask whichever endpoint is due. Never raises for HTTP trouble."""
+        if token != self._token:
+            # A new token (a refresh, or a sign-in -- possibly to another
+            # account): ask again now rather than wait out the interval, unless
+            # Claude has told us to wait. The cache is kept, not dropped, so a
+            # pause doesn't blank the plan tier and spend on every refresh.
+            self._token = token
+            if self._paused_until is None or now >= self._paused_until:
+                self._usage_due = self._profile_due = 0.0
+        if self._paused_until is not None and now >= self._paused_until:
+            self._paused_until = None
+        if self._paused_until is not None:
+            return
+        if now >= self._usage_due:
+            try:
+                resp = http.get(USAGE_URL, headers=headers)
+                if resp.status_code == 429:
+                    self._rate_limited(resp, now)
+                    return
+                # raise_for_status: an error body parses as JSON too, and would
+                # read as "no scoped windows" rather than "didn't find out".
+                body = resp.raise_for_status().json()
+                if not isinstance(body, dict):
+                    raise ValueError("usage body is not an object")
+                self._usage = body
+                self._usage_due = now + USAGE_DETAILS_INTERVAL
+                self._backoff = DETAILS_429_DEFAULT
+            except (httpx.HTTPError, ValueError, TypeError):
+                self._usage_due = now + DETAILS_RETRY_AFTER_ERROR
+        if now >= self._profile_due:
+            try:
+                resp = http.get(PROFILE_URL, headers=headers)
+                if resp.status_code == 429:
+                    self._rate_limited(resp, now)
+                    return
+                body = resp.raise_for_status().json()
+                if isinstance(body, dict):
+                    self._profile = body
+                self._profile_due = now + PROFILE_INTERVAL
+            except (httpx.HTTPError, ValueError, TypeError):
+                # Only the plan tier comes from here; a failure must not cost
+                # the usage fields, and is retried at the usage cadence.
+                self._profile_due = now + USAGE_DETAILS_INTERVAL
+
+    def apply(self, sample: UsageSample) -> None:
+        """Copy the last-known details onto a sample. With no usage body yet,
+        scoped_windows stays None ("didn't find out"), never an empty list."""
+        if self._usage is None and self._profile is None:
+            sample.details_paused_until = self._paused_until
+            return
+        fields = usage_fields_from_json(self._usage, self._profile)
+        if self._usage is None:
+            fields = {"plan_tier": fields["plan_tier"]}
+        for k, v in fields.items():
+            setattr(sample, k, v)
+        sample.details_paused_until = self._paused_until
+
+
+def _poll_once(token: str, details: UsageDetails | None = None) -> UsageSample:
     """Make one rate-limit probe. Returns a sample with ok=False on failure."""
     headers = dict(API_HEADERS_TEMPLATE)
     headers["Authorization"] = f"Bearer {token}"
@@ -257,18 +422,14 @@ def _poll_once(token: str) -> UsageSample:
             resp.raise_for_status()
             sample = sample_from_headers(resp.headers, now)
             # K1: enrich with the OAuth usage + profile endpoints (plan tier,
-            # extra-usage spend, per-model windows) on the same client/cadence.
-            # Non-fatal: any failure leaves the header-derived sample intact.
-            # raise_for_status on usage only: its error body parses as JSON too,
-            # and would read as "no scoped windows" rather than "didn't find
-            # out". A profile error body just leaves the plan tier unknown.
-            try:
-                usage = http.get(USAGE_URL, headers=headers).raise_for_status().json()
-                profile = http.get(PROFILE_URL, headers=headers).json()
-                for k, v in usage_fields_from_json(usage, profile).items():
-                    setattr(sample, k, v)
-            except (httpx.HTTPError, ValueError, TypeError):
-                pass
+            # extra-usage spend, per-model windows). Throttled and cached by
+            # UsageDetails; a caller without one (tests, one-off probes) gets a
+            # fresh one, which simply asks both endpoints now. Non-fatal: any
+            # failure leaves the header-derived sample intact.
+            if details is None:
+                details = UsageDetails()
+            details.fetch(http, headers, token, now)
+            details.apply(sample)
     except httpx.HTTPStatusError as exc:
         # The server answered and refused. Caught before HTTPError below:
         # HTTPStatusError is a subclass of it.
@@ -286,7 +447,9 @@ def _poll_once(token: str) -> UsageSample:
             status = STATUS_REAUTH_NEEDED
         else:
             status = STATUS_HTTP_ERROR
-        return UsageSample(0, 0, 0, 0, status, False, str(exc), now)
+        reason = api_error_reason(exc.response)
+        error = f"HTTP {code}: {reason}" if reason else str(exc)
+        return UsageSample(0, 0, 0, 0, status, False, error, now, reason=reason)
     except httpx.HTTPError as exc:
         # Transport-level: timeout, DNS failure, connection refused. Nothing is
         # wrong with the token, so it must not read as an auth problem.
@@ -341,6 +504,8 @@ class UsagePoller(QThread):
         # A CHANGE here means somebody signed in again, which clears the block
         # without anything having to notify us.
         self._blocked_expiry_ms: int | None = None
+        # The usage/profile throttle + cache, kept across polls.
+        self._details = UsageDetails()
 
     def stop(self) -> None:
         self._stop = True
@@ -462,7 +627,7 @@ class UsagePoller(QThread):
         the caller keeps the failed sample."""
         fresh = read_token()
         if fresh and fresh != used_token:
-            return _poll_once(fresh)
+            return _poll_once(fresh, self._details)
         if (not self._auto_refresh
                 or not token_refresh.auto_refresh_supported()
                 or self._reauth_needed()
@@ -471,7 +636,7 @@ class UsagePoller(QThread):
         self._do_refresh(manual=False, seen_access=used_token)
         fresh = read_token()
         if fresh and fresh != used_token:
-            return _poll_once(fresh)
+            return _poll_once(fresh, self._details)
         return None
 
     def run(self) -> None:  # QThread entry
@@ -489,7 +654,7 @@ class UsagePoller(QThread):
                     f"No token in {token_source_description()}", time.time(),
                 ))
             else:
-                sample = _poll_once(token)
+                sample = _poll_once(token, self._details)
                 if sample.status == STATUS_AUTH_EXPIRED:
                     sample = self._recover_from_401(token) or sample
                 self.sample.emit(self._mark_reauth(sample))

@@ -69,6 +69,7 @@ from PySide6.QtWidgets import (
 )
 
 import app_settings
+import build_info
 import macos_keychain
 import poll_cadence
 import reauth
@@ -118,6 +119,12 @@ from transcript import (
 )
 from uiutil import (ThemedPopup, bar_warn_thresholds, is_wayland, make_popup,
                     format_minutes as _format_minutes, heat as _heat)
+
+
+def _version_label() -> str:
+    """APP_VERSION plus the commit it was built from (see build_info)."""
+    v = app_settings.APP_VERSION
+    return build_info.version_label(v, build_info.current(v))
 
 
 # What the bottom-left badge says when a poll FAILS: {status: (text, icon, level)}.
@@ -1759,6 +1766,8 @@ class SettingsPanel(QWidget):
         # whether automatic refresh has been switched off; this panel must not
         # promise one while it is.
         self._reauth_needed = False
+        # Claude's own words for the refusal behind it, when it gave any.
+        self._reauth_reason: str | None = None
         self._on_poll_interval_changed = on_poll_interval_changed
         self._on_sessions_view_changed = on_sessions_view_changed
         self._on_token_view_changed = on_token_view_changed
@@ -2114,6 +2123,14 @@ class SettingsPanel(QWidget):
         self._poll_note_hold.timeout.connect(self._fade_poll_note)
         layout.addWidget(self.poll_interval_note)
 
+        # Shown only while Claude has rate-limited the usage-details endpoint
+        # (extra-usage spend, scoped limits, plan). The 5h/7d bars come from a
+        # different request and keep updating, so this is a note, not a badge.
+        self.details_paused_note = QLabel("", objectName="sectionHint")
+        self.details_paused_note.setWordWrap(True)
+        self.details_paused_note.hide()
+        layout.addWidget(self.details_paused_note)
+
         # Idle back-off: slow polling when no local session has been active for a
         # while. Opt-in; the sub-box (after / interval spinners) follows the toggle.
         self.idle_backoff_check = QCheckBox("Slow polling when idle")
@@ -2338,7 +2355,9 @@ class SettingsPanel(QWidget):
             # DOES matter is update_check.REPO, which builds the releases API
             # URL and gates which release URLs are trusted; that one has to move
             # in the same commit as the rename or update checking breaks.
-            f"Clawdmeter  v{app_settings.APP_VERSION}\n"
+            # The build label, not the bare APP_VERSION: a dev build reads
+            # "3.1.0+dev.<sha>" so it can't be mistaken for the release.
+            f"Clawdmeter  v{_version_label()}\n"
             "by Nick Welter (@weltern) & Claude\n"
             "github.com/weltern/Clawdmeter\n\n"
             "MIT licensed · the Clawd mascot is © Anthropic PBC and is "
@@ -2552,7 +2571,13 @@ class SettingsPanel(QWidget):
             # and neither is visible in expiresAt — a revoked token still reads
             # "valid for hours", which is what this line used to say while
             # every other surface said "sign in again".
-            if exp is not None and exp / 1000 - time.time() <= 0:
+            if self._reauth_reason:
+                # Claude's own words go first: "revoked" and "expired" are
+                # both a 401, and only this text tells the user which.
+                self.token_status.setText(
+                    f"Claude rejected this token: \u201c{self._reauth_reason}\u201d "
+                    "Use Sign in again above.")
+            elif exp is not None and exp / 1000 - time.time() <= 0:
                 self.token_status.setText(
                     "Token expired and can't be refreshed — use Sign in again above.")
             else:
@@ -2692,19 +2717,38 @@ class SettingsPanel(QWidget):
             self.set_token_status("Refreshing…")
             self._on_refresh_token()
 
-    def set_reauth_needed(self, needed: bool) -> None:
-        """Tell the panel that automatic refresh has been switched off.
+    def set_reauth_needed(self, needed: bool, reason: str | None = None) -> None:
+        """Tell the panel that automatic refresh has been switched off, and
+        (when Claude said) why.
 
         Re-renders only on a CHANGE: this is fed from every poll, and an
         unconditional re-render would wipe the held failure message that
         set_token_status() puts up, once per poll, before it could be read.
         """
         needed = bool(needed)
-        if needed == self._reauth_needed:
+        reason = (reason or None) if needed else None
+        if needed == self._reauth_needed and reason == self._reauth_reason:
             return
         self._reauth_needed = needed
+        self._reauth_reason = reason
         if self.connection_tab_is_current():
             self.refresh_token_status()
+
+    def set_details_paused(self, until: float | None) -> None:
+        """Show or clear the "usage details paused" note under USAGE POLLING.
+        ``until`` is epoch seconds, None when nothing is paused."""
+        if until is None:
+            self.details_paused_note.hide()
+            self.details_paused_note.clear()
+            return
+        from datetime import datetime
+        when = datetime.fromtimestamp(until).strftime("%I:%M %p").lstrip("0")
+        self.details_paused_note.setText(
+            "Claude is rate-limiting the usage-details request (extra usage, "
+            f"per-model limits, plan), so it is paused until {when}. The "
+            "session and weekly bars keep updating; the details show their "
+            "last values until then.")
+        self.details_paused_note.show()
 
     def _set_reauth_enabled(self, enabled: bool, tooltip: str) -> None:
         """Enable/disable the sign-in button, saying why when it is off.
@@ -4527,9 +4571,11 @@ class Dashboard(QMainWindow):
         # between knows nothing about the token and used to clear it, so the
         # tab went back to "wait for auto-refresh" while none was coming.
         if s.status == STATUS_REAUTH_NEEDED:
-            self.settings_panel.set_reauth_needed(True)
+            self.settings_panel.set_reauth_needed(True, getattr(s, "reason", None))
         elif s.ok:
             self.settings_panel.set_reauth_needed(False)
+            self.settings_panel.set_details_paused(
+                getattr(s, "details_paused_until", None))
         self._refresh_token_status_if_watched()
         if s.ok:
             self._observe_scoped(s)
@@ -4555,6 +4601,11 @@ class Dashboard(QMainWindow):
         self._maybe_backoff_poll()     # adjust cadence to local session activity
         if not s.ok:
             self._apply_status_badge(s.status)
+            # Hovering the badge shows Claude's own reason ("OAuth access
+            # token has been revoked."), else the raw error, so the cause is
+            # one hover away instead of needing a hand-made API probe.
+            self.status_container.setToolTip(
+                getattr(s, "reason", None) or s.error or "")
             # Same wording as the badge, so the tray and the window can't
             # disagree — and so the tooltip stops reading as a raw status slug.
             failure = FAILURE_BADGES.get((s.status or "").lower())
@@ -4585,6 +4636,7 @@ class Dashboard(QMainWindow):
             self._update_sprite_selection()
 
         self._apply_status_badge(s.status)
+        self.status_container.setToolTip("")
         self._set_tray_tooltip(s.session_pct, s.session_reset_minutes,
                                s.weekly_pct, s.weekly_reset_minutes)
 

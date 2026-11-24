@@ -344,6 +344,9 @@ channels are shared across every alert.
 
 - Version, author, and credits — the source is **MIT** licensed; the Clawd mascot
   is © Anthropic PBC and **not** covered by it; icons are Font Awesome Free.
+- The version names the commit it was built from: `3.1.0 (3ec0425)` for a
+  release, `3.1.0+dev.<commit>` for any other build, so a local build can't be
+  mistaken for the release.
 
 ## Windows, macOS and Linux
 
@@ -461,9 +464,11 @@ It reads your Claude Code OAuth token from `~/.claude/.credentials.json` — or
 from the **login Keychain** on macOS, where Claude Code stores it instead —
 sends a minimal 1-token request to `api.anthropic.com/v1/messages` on a
 configurable interval (60s by default), and reads the rate-limit headers from
-the response. On the same poll it also reads Anthropic's OAuth usage and profile
-endpoints (`/api/oauth/usage`, `/api/oauth/profile`) for your plan, extra-usage
-spend and per-model limits. The Stats page values your **local transcripts**
+the response. Less often (usage every 5 minutes, profile hourly) it also reads
+Anthropic's OAuth usage and profile endpoints (`/api/oauth/usage`,
+`/api/oauth/profile`) for your plan, extra-usage spend and per-model limits; if
+Claude rate-limits those, Clawdmeter waits out the `Retry-After` and keeps the
+last values (Settings → Connection says so). The Stats page values your **local transcripts**
 against a bundled price map — no extra API calls. The window minimises to the
 system tray; closing the window hides it. **Quit** from the tray menu fully
 exits.
